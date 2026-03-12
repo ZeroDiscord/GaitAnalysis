@@ -1,5 +1,12 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# HPC Job Submission Scripts
+submit_gait.sh
+*.o*
+*.e*
 *.py[cod]
 *$py.class
 

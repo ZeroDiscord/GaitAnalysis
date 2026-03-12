@@ -12,7 +12,7 @@ from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_steps=1):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1):
     model.train()
     running_loss = 0.0
     all_preds = []
@@ -25,8 +25,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_s
         masks = masks.to(device)
         labels = labels.to(device)
 
-        # Forward pass with Automatic Mixed Precision
-        with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu'):
+        # Use bfloat16 if supported (essential for H100) to prevent NaN overflow
+        amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
+        with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
             outputs = model(features, masks)
             loss = criterion(outputs, labels) / accum_steps
         
@@ -35,12 +36,13 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_s
         
         # Unscale and step if we've reached the accumulation boundary
         if (i + 1) % accum_steps == 0 or (i + 1) == len(dataloader):
-            # Gradient clipping for stability in sequence models
+            # Gradient clipping for strict stability in long sequence models (0.5 threshold)
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             optimizer.zero_grad()
 
         running_loss += (loss.item() * accum_steps) * features.size(0)
@@ -71,7 +73,8 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
             masks = masks.to(device)
             labels = labels.to(device)
 
-            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu'):
+            amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
+            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
                 outputs = model(features, masks)
                 loss = criterion(outputs, labels)
 
@@ -80,7 +83,8 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
             probs = torch.nn.functional.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
             
-            all_probs.extend(probs.cpu().numpy())
+            # Convert bfloat16 explicitly to float32 before passing to numpy
+            all_probs.extend(probs.float().cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -94,10 +98,11 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
         if num_classes == 2:
             auc = roc_auc_score(all_labels, all_probs_np[:, 1])
         else:
-            # Multi-class One-vs-Rest AUC
-            auc = roc_auc_score(all_labels, all_probs_np, multi_class='ovr')
+            # Multi-class One-vs-Rest AUC explicitly requires the 'labels' parameter
+            # to prevent crashing if a class is entirely missing in a mini-test-set
+            auc = roc_auc_score(all_labels, all_probs_np, multi_class='ovr', labels=list(range(num_classes)))
     except Exception as e:
-        auc = 0.0 # Can happen if a class is entirely missing in a mini-test-set
+        auc = 0.0 # Extreme fallback if entirely mathematically impossible
         
     cm = confusion_matrix(all_labels, all_preds)
 
@@ -197,9 +202,17 @@ def main():
     
     # Calculate class weights for imbalanced datasets
     class_weights = dataset.get_class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # Added label_smoothing to prevent overconfidence on the small dataset (improves generalization)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    
+    # Initialize robust Learning Rate Scheduler (OneCycleLR for stable warm-up and cool-down)
+    total_steps = int(args.epochs * np.ceil(len(train_loader) / args.accum_steps))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=args.lr, total_steps=total_steps,
+        pct_start=0.1, anneal_strategy='cos'
+    )
     
     # Initialize Mixed Precision Scaler
     scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
@@ -210,7 +223,7 @@ def main():
     for epoch in range(args.epochs):
         # Train
         train_loss, train_acc, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, accum_steps=args.accum_steps
+            model, train_loader, criterion, optimizer, device, scaler, scheduler, accum_steps=args.accum_steps
         )
         
         # Validate

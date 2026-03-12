@@ -90,12 +90,18 @@ class GaitPathologyDataset(Dataset):
         # Convert to tensor and float32 type
         features_tensor = torch.tensor(features, dtype=torch.float32)
         
-        # Basic normalization (z-score along the time dimension per feature)
+        # Base normalization (z-score along the time dimension per feature)
         # Note: In a real scenario, global dataset statistics are better, but per-sequence works as a baseline
         mean = torch.mean(features_tensor, dim=0, keepdim=True)
         std = torch.std(features_tensor, dim=0, keepdim=True)
         # Add epsilon to prevent division by zero
         features_tensor = (features_tensor - mean) / (std + 1e-8)
+        
+        # Absolute fail-safe against random CSV missing values or flat gradients causing NaNs
+        features_tensor = torch.nan_to_num(features_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Hard clamp extreme outliers (safeguards the neural network from exploding gradients on 20k sequences)
+        features_tensor = torch.clamp(features_tensor, min=-10.0, max=10.0)
         
         if self.transform:
             features_tensor = self.transform(features_tensor)
@@ -128,7 +134,8 @@ def create_dataloaders(data_dir, batch_size=32, val_split=0.2, test_split=0.1, r
     """
     Utility function to create separate train, validation, and test dataloaders.
     """
-    from torch.utils.data import random_split
+    from sklearn.model_selection import train_test_split
+    from torch.utils.data import Subset, random_split
     
     dataset = GaitPathologyDataset(data_dir=data_dir)
     
@@ -140,10 +147,32 @@ def create_dataloaders(data_dir, batch_size=32, val_split=0.2, test_split=0.1, r
     val_size = int(total_size * val_split)
     train_size = total_size - test_size - val_size
     
-    generator = torch.Generator().manual_seed(random_seed)
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size], generator=generator
-    )
+    try:
+        # Attempt Stratified Split to guarantee ALL classes exist in Train, Val, and Test
+        # (This mathematically prevents the AUC=0 collapse!)
+        indices = list(range(total_size))
+        labels = dataset.labels
+        
+        train_idx, temp_idx, _, temp_labels = train_test_split(
+            indices, labels, test_size=(val_size + test_size), stratify=labels, random_state=random_seed
+        )
+        
+        test_ratio_of_temp = test_size / (val_size + test_size) if (val_size + test_size) > 0 else 0
+        val_idx, test_idx = train_test_split(
+            temp_idx, test_size=test_ratio_of_temp, stratify=temp_labels, random_state=random_seed
+        )
+        
+        train_dataset = Subset(dataset, train_idx)
+        val_dataset = Subset(dataset, val_idx)
+        test_dataset = Subset(dataset, test_idx)
+        
+    except ValueError:
+        # Fallback to pure random split if a highly imbalanced class has < 2 samples total
+        print("Warning: Dataset too small for Stratified split. Falling back to Random split. (This can mathematically cause AUC=0.0)")
+        generator = torch.Generator().manual_seed(random_seed)
+        train_dataset, val_dataset, test_dataset = random_split(
+            dataset, [train_size, val_size, test_size], generator=generator
+        )
     
     train_loader = DataLoader(
         train_dataset, 
