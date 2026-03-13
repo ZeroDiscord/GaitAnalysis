@@ -121,9 +121,12 @@ def parallel_chunked_scan(x, dt, A_log, B, C, D, z, chunk_size=2048):
     # Pre-allocate output to stream memory efficiently
     y_out = torch.empty_like(x)
     
-    # Numerical Stabilization: Softplus on dt, exp on A
-    dt = F.softplus(dt)
-    A = -torch.exp(A_log.float()) # (d_inner, d_state)
+    # Numerical Stabilization: Clamp dt directly to avoid softplus -> exp explosion
+    dt_clamped = torch.clamp(dt, min=-20.0, max=5.0)
+    dt_soft = F.softplus(dt_clamped)
+    
+    # A clamped for transition stability
+    A_clamped = torch.clamp(-torch.exp(A_log.float()), max=-1e-4) # (d_inner, d_state)
     
     # Persistent State cross-chunk
     state = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=torch.float32)
@@ -138,13 +141,13 @@ def parallel_chunked_scan(x, dt, A_log, B, C, D, z, chunk_size=2048):
         
         # Extract slices
         x_c = x[:, start_idx:end_idx, :]
-        dt_c = dt[:, start_idx:end_idx, :]
+        dt_c = dt_soft[:, start_idx:end_idx, :] # USING THE CLAMPED DT
         B_c = B[:, start_idx:end_idx, :]
         C_c = C[:, start_idx:end_idx, :]
         
         # Discretize continuous matrices (Parallel Processing within chunk)
         # delta * A -> (batch, c_len, d_inner, d_state)
-        dA = torch.exp(torch.einsum('bld,dn->bldn', dt_c, A))
+        dA = torch.exp(torch.einsum('bld,dn->bldn', dt_c, A_clamped)) # USING CLAMPED A
         
         # delta * B * x -> (batch, c_len, d_inner, d_state)
         dB = torch.einsum('bld,bln,bld->bldn', dt_c, B_c, x_c)
@@ -155,6 +158,9 @@ def parallel_chunked_scan(x, dt, A_log, B, C, D, z, chunk_size=2048):
         y_chunk = torch.empty_like(x_c)
         for t in range(c_len):
             state = state * dA[:, t, :, :] + dB[:, t, :, :]
+            # Periodic state clamping to catch runaway accumulation
+            if t % 100 == 99:
+                state = torch.clamp(state, min=-1e4, max=1e4)
             y_chunk[:, t, :] = torch.einsum('bdn,bn->bd', state, C_c[:, t, :])
             
         y_out[:, start_idx:end_idx, :] = y_chunk
@@ -200,6 +206,11 @@ class AcceleratedMambaBlock(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
     def forward(self, x, mask=None):
+        # CRITICAL: Force float32 for the entire Mamba recurrence to prevent
+        # catastrophic floating-point drift over 2000 sequential timesteps in bfloat16.
+        original_dtype = x.dtype
+        x = x.float()
+        
         batch, seq_len, _ = x.shape
         x_proj = self.in_proj(x)
         x_inner, z_res = x_proj.chunk(2, dim=-1)
@@ -216,14 +227,13 @@ class AcceleratedMambaBlock(nn.Module):
         dt = self.dt_proj(dt)
         
         # Dispatch to Kernel or Chunked Streaming Fallback
-        # Note: True Triton kernel dispatch would happen here if fully wired up to autograd
         y = parallel_chunked_scan(
             x_act, dt, self.A_log, B, C, self.D, z_res, 
             chunk_size=self.chunk_size
         )
         
         out = self.out_proj(y)
-        return out
+        return out.to(original_dtype)
 
 class HardwareMambaGaitClassifier(nn.Module):
     """

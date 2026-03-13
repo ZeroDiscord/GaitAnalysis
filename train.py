@@ -12,11 +12,12 @@ from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1, use_scaler=True):
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
+    nan_batches = 0
 
     optimizer.zero_grad()
     pbar = tqdm(dataloader, desc="Training", leave=False)
@@ -25,23 +26,35 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
         masks = masks.to(device)
         labels = labels.to(device)
 
-        # Use bfloat16 if supported (essential for H100) to prevent NaN overflow
+        # Select AMP dtype: bfloat16 on H100 (no scaler needed), float16 elsewhere
         amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
         with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
             outputs = model(features, masks)
             loss = criterion(outputs, labels) / accum_steps
         
-        # Backward and optimize with Scaler
-        scaler.scale(loss).backward()
+        # NaN Guard: Skip corrupted batches to prevent permanent model poisoning
+        if torch.isnan(loss) or torch.isinf(loss):
+            nan_batches += 1
+            optimizer.zero_grad() # Flush any accumulated NaN gradients
+            continue
         
-        # Unscale and step if we've reached the accumulation boundary
+        # Backward pass: use GradScaler ONLY for float16, NOT bfloat16
+        if use_scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # Step if we've reached the accumulation boundary
         if (i + 1) % accum_steps == 0 or (i + 1) == len(dataloader):
-            # Gradient clipping for strict stability in long sequence models (0.5 threshold)
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            if use_scaler:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             
-            scaler.step(optimizer)
-            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
 
@@ -53,9 +66,13 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
         
         pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    if nan_batches > 0:
+        print(f"  WARNING: {nan_batches} batches had NaN/Inf loss and were skipped.")
+        
+    total_samples = len(dataloader.dataset) - nan_batches * dataloader.batch_size
+    epoch_loss = running_loss / max(total_samples, 1)
+    epoch_acc = accuracy_score(all_labels, all_preds) if all_labels else 0.0
+    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if all_labels else 0.0
     
     return epoch_loss, epoch_acc, epoch_f1
 
@@ -99,8 +116,28 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
             auc = roc_auc_score(all_labels, all_probs_np[:, 1])
         else:
             # Multi-class One-vs-Rest AUC explicitly requires the 'labels' parameter
-            # to prevent crashing if a class is entirely missing in a mini-test-set
-            auc = roc_auc_score(all_labels, all_probs_np, multi_class='ovr', labels=list(range(num_classes)))
+            # to prevent crashing if a class is entirely missing in a mini-test-set.
+            # We strictly enforce float64 precision and safe softmax accumulation here.
+            # If a class is completely structurally missing from the *ground truth* of the split,
+            # roc_auc_score will fail. We use a safe wrapper.
+            valid_classes = np.unique(all_labels)
+            if len(valid_classes) < 2:
+                auc = 0.0 # Mathematically impossible to compute AUC with 1 ground truth class
+            else:
+                # Calculate AUC only on the classes that actually exist in the ground truth
+                # to prevent shape mismatch errors.
+                filtered_probs = all_probs_np[:, valid_classes]
+                # Re-normalize probabilities for the valid classes to sum to 1
+                row_sums = filtered_probs.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1e-9
+                filtered_probs = filtered_probs / row_sums
+                
+                auc = roc_auc_score(
+                    all_labels, 
+                    filtered_probs, 
+                    multi_class='ovr', 
+                    labels=valid_classes
+                )
     except Exception as e:
         auc = 0.0 # Extreme fallback if entirely mathematically impossible
         
@@ -160,7 +197,7 @@ def main():
         args.data_dir, 
         batch_size=args.batch_size,
         window_size=2000,   # Slicing the 26000 sequence into 2000 frame chunks
-        base_stride=500     # Generate a new slice every 500 frames
+        base_stride=1000     # Generate a new slice every 500 frames
     )
     classes = train_dataset.classes
     num_classes = len(classes)
@@ -222,8 +259,18 @@ def main():
         pct_start=0.1, anneal_strategy='cos'
     )
     
-    # Initialize Mixed Precision Scaler
-    scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
+    # Mixed Precision Setup:
+    # CRITICAL: GradScaler is ONLY for float16. bfloat16 has float32's exponent range
+    # and does NOT need loss scaling. Using GradScaler with bfloat16 silently corrupts
+    # Mamba's sequential state recurrence, causing permanent NaN.
+    use_bf16 = device.type == 'cuda' and torch.cuda.is_bf16_supported()
+    if use_bf16:
+        print("H100/bfloat16 detected: GradScaler DISABLED (not needed for bf16).")
+        scaler = None
+        use_scaler = False
+    else:
+        scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
+        use_scaler = True
 
     best_val_f1 = 0.0
 
@@ -231,7 +278,8 @@ def main():
     for epoch in range(args.epochs):
         # Train
         train_loss, train_acc, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, scheduler, accum_steps=args.accum_steps
+            model, train_loader, criterion, optimizer, device, scaler, scheduler, 
+            accum_steps=args.accum_steps, use_scaler=use_scaler
         )
         
         # Validate

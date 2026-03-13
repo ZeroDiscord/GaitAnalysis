@@ -135,7 +135,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_plot', type=str, default='confusion_matrix.png', help='Where to save the CM plot')
     
     # Model architecture parameters (must match the trained model!)
-    parser.add_argument('--d_model', type=int, default=64, help='Hidden dimension used in training')
+    parser.add_argument('--d_model', type=int, default=32, help='Hidden dimension used in training (default is now 32)')
     parser.add_argument('--n_layers', type=int, default=2, help='Number of layers used in training')
     
     # Model selection flags (Only pass one)
@@ -158,7 +158,7 @@ if __name__ == "__main__":
             args.data_dir, 
             batch_size=args.batch_size,
             window_size=2000,
-            base_stride=500
+            base_stride=1000
         )
     except Exception as e:
         print(f"Failed to load dataset: {e}")

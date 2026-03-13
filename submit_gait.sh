@@ -13,17 +13,8 @@ source /home/soft/anaconda3/etc/profile.d/conda.sh
 conda activate gait_env
 module load cuda
 
-# 1. Run GRU Baseline Training First
-echo "--- Starting GRU Baseline Training on H100 ---"
-python3 train.py \
-    --data_dir "/home/aantriksh.124259/Datasets" \
-    --epochs 100 \
-    --batch_size 16 \
-    --accum_steps 2 \
-    --use_gru_baseline \
-    --output_name "best_gru_baseline.pth"
 
-# 2. Run Mamba Training
+# 1. Run Mamba Training
 echo "--- Starting Mamba Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
@@ -32,3 +23,12 @@ python3 train.py \
     --accum_steps 2 \
     --use_triton_mamba \
     --output_name "best_mamba_model.pth"
+# 2. Run GRU Baseline Training First
+echo "--- Starting GRU Baseline Training on H100 ---"
+python3 train.py \
+    --data_dir "/home/aantriksh.124259/Datasets" \
+    --epochs 100 \
+    --batch_size 16 \
+    --accum_steps 2 \
+    --use_gru_baseline \
+    --output_name "best_gru_baseline.pth"

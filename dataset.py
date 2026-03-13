@@ -13,7 +13,7 @@ class GaitPathologyDataset(Dataset):
     Global Normalization, and Temporal Jittering.
     """
     def __init__(self, file_paths, labels, class_to_idx, alpha=1.0, beta=1.0, 
-                 window_size=2000, base_stride=500, mode='train', 
+                 window_size=2000, base_stride=1000, mode='train', 
                  global_mean=None, global_std=None, balance_classes=True):
         """
         Args:
@@ -42,8 +42,8 @@ class GaitPathologyDataset(Dataset):
         self.base_samples = []
         for path, label in zip(file_paths, labels):
             df = pd.read_csv(path, header=None)
-            e_ant = df.iloc[:, 0].values
-            e_ago = df.iloc[:, 1].values
+            e_ago = df.iloc[:, 0].values  # Agonist is column 0
+            e_ant = df.iloc[:, 1].values  # Antagonist is column 1
             
             torque = self.alpha * e_ant - self.beta * e_ago
             stiffness = e_ant + e_ago
@@ -226,7 +226,7 @@ def manual_stratified_split(file_paths, labels, val_split=0.2, test_split=0.1, r
                 
     return (train_paths, train_labels), (val_paths, val_labels), (test_paths, test_labels)
 
-def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=500, random_seed=42):
+def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=1000, random_seed=42):
     """
     Utility function to create separate train, validation, and test dataloaders
     using Sliding Windows and Strict Patient-Level Splitting.
