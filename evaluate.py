@@ -1,5 +1,6 @@
 import os
 import argparse
+import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -63,23 +64,55 @@ def plot_confusion_matrix(cm, classes, save_path="confusion_matrix.png"):
     plt.savefig(save_path, dpi=300)
     print(f"Saved confusion matrix plot to {save_path}")
 
-def run_evaluation(model, dataloader, device, num_classes, class_names):
+def _count_parameters(model):
+    """Count total and trainable parameters."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def run_evaluation(model, dataloader, device, num_classes, class_names, benchmark=False):
     model.eval()
     all_preds = []
     all_labels = []
     all_probs = []
+    batch_times = []
+    total_samples = 0
+
+    # GPU warm-up (avoids cold-start skewing the first batch)
+    if device.type == 'cuda':
+        dummy = torch.randn(1, 100, 4, device=device)
+        with torch.no_grad():
+            try:
+                model(dummy, torch.ones(1, 100, device=device))
+            except Exception:
+                pass
+        torch.cuda.synchronize()
 
     print("\nStarting Evaluation...")
+    wall_start = time.perf_counter()
+
     with torch.no_grad():
         for features, masks, labels in dataloader:
             features = features.to(device)
             masks = masks.to(device)
             labels = labels.to(device)
+            batch_size = features.size(0)
+            total_samples += batch_size
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
             # Use AMP for fast inference if supported
             amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
             with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
                 outputs = model(features, masks)
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            batch_times.append((t1 - t0, batch_size))
             
             # Explicit bfloat16 to float32 cast BEFORE softmax so probabilities sum exactly to 1.0
             probs = torch.nn.functional.softmax(outputs.float(), dim=1)
@@ -88,6 +121,9 @@ def run_evaluation(model, dataloader, device, num_classes, class_names):
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+
+    wall_end = time.perf_counter()
+    wall_elapsed = wall_end - wall_start
 
     # Compute Final Metrics
     acc = accuracy_score(all_labels, all_preds)
@@ -125,6 +161,36 @@ def run_evaluation(model, dataloader, device, num_classes, class_names):
     # Ignore warnings for undefined metrics if a class was never predicted
     print(classification_report(all_labels, all_preds, labels=range(num_classes), target_names=class_names, zero_division=0))
     print("="*50)
+
+    # ── Inference-Time Metrics ─────────────────────────────────────────
+    total_param, trainable_param = _count_parameters(model)
+    sum_batch_time = sum(t for t, _ in batch_times)
+    per_sample_ms = (sum_batch_time / max(total_samples, 1)) * 1000
+    throughput = total_samples / max(sum_batch_time, 1e-9)
+
+    print("\n" + "="*50)
+    print("             INFERENCE / EFFICIENCY METRICS")
+    print("="*50)
+    print(f"Total parameters:       {total_param:,}")
+    print(f"Trainable parameters:   {trainable_param:,}")
+    print(f"Model size (approx):    {total_param * 4 / 1024 / 1024:.2f} MB (FP32)")
+    print(f"Total samples:          {total_samples}")
+    print(f"Wall-clock time:        {wall_elapsed:.4f} s")
+    print(f"Forward-pass time:      {sum_batch_time:.4f} s")
+    print(f"Latency / sample:       {per_sample_ms:.3f} ms")
+    print(f"Throughput:             {throughput:.1f} samples/s")
+
+    if device.type == 'cuda':
+        peak_mem = torch.cuda.max_memory_allocated(device) / 1024 / 1024
+        print(f"Peak GPU memory:        {peak_mem:.1f} MB")
+
+    if benchmark:
+        # Detailed per-batch breakdown
+        print("\n  Per-batch latency breakdown:")
+        for i, (bt, bs) in enumerate(batch_times):
+            print(f"    Batch {i:>3d}:  {bt*1000:7.2f} ms  ({bs} samples, {bt/bs*1000:.2f} ms/sample)")
+
+    print("="*50)
     
     return all_labels, all_preds, all_probs, cm
 
@@ -145,6 +211,7 @@ if __name__ == "__main__":
     
     # Use testing batch size (can be larger up to memory limit since no gradients stored)
     parser.add_argument('--batch_size', type=int, default=4, help='Inference batch size')
+    parser.add_argument('--benchmark', action='store_true', help='Print detailed per-batch inference timing breakdown')
 
     args = parser.parse_args()
     
@@ -176,5 +243,5 @@ if __name__ == "__main__":
          
     model = load_model(args, num_classes, device)
     
-    _, _, _, cm = run_evaluation(model, test_loader, device, num_classes, class_names)
+    _, _, _, cm = run_evaluation(model, test_loader, device, num_classes, class_names, benchmark=args.benchmark)
     plot_confusion_matrix(cm, class_names, save_path=args.output_plot)

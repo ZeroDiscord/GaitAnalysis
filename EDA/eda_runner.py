@@ -81,7 +81,8 @@ def main():
     print(f'\nFeature table saved → {csv_path}')
 
     # ── Step 5–6: Visualisations ──────────────────────────────────────────
-    generate_all_plots(df, classes, args.output_dir)
+    generate_all_plots(df, classes, args.output_dir,
+                       data_dir=args.data_dir, alpha=args.alpha, beta=args.beta)
 
     # ── Done ──────────────────────────────────────────────────────────────
     print('\n' + '=' * 60)

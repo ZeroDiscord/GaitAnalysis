@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N GaitMamba_H100
+#PBS -N gaitAnalysis
 #PBS -q gpu
 #PBS -l select=1:ncpus=10:ngpus=1:mem=32g
 #PBS -j oe

@@ -228,10 +228,197 @@ def plot_feature_distributions(df, classes, output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Signal waveform plots (raw time-series with interpretations)
+# ---------------------------------------------------------------------------
+
+# Consistent, colourblind-friendly palette for the two EMG channels
+_EMG_COLORS = {
+    'agonist':    '#2196F3',   # vivid blue
+    'antagonist': '#F44336',   # vivid red
+    'torque':     '#7C4DFF',   # deep purple
+    'stiffness':  '#FF9800',   # amber
+}
+
+
+def _find_interesting_clip(signal, clip_len=1000):
+    """
+    Slide a window across *signal* and return the start index of the segment
+    with the highest variance — this is typically where the most informative
+    gait-cycle dynamics live.
+    """
+    if len(signal) <= clip_len:
+        return 0
+    best_start, best_var = 0, -1
+    step = max(clip_len // 4, 1)
+    for s in range(0, len(signal) - clip_len, step):
+        v = np.var(signal[s:s + clip_len])
+        if v > best_var:
+            best_var = v
+            best_start = s
+    return best_start
+
+
+def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
+                          clip_len=1000):
+    """
+    For each class, pick one representative patient, auto-select an
+    interesting ~clip_len segment, and plot:
+
+      Panel 1  —  Agonist + Antagonist overlaid (interaction view)
+      Panel 2  —  Torque  (net activation proxy)
+      Panel 3  —  Stiffness  (co-contraction proxy, filled)
+
+    Also produces a comparison grid with one column per class.
+    """
+    all_classes = sorted(classes_with_paths.keys())
+
+    # ── Per-class individual plots ──────────────────────────────────────
+    for cls_name in all_classes:
+        file_list = classes_with_paths[cls_name]
+        if not file_list:
+            continue
+        csv_path, patient_id = file_list[0]
+
+        df_raw = pd.read_csv(csv_path, header=None)
+        e_ago_full = np.nan_to_num(df_raw.iloc[:, 0].values.astype(float))
+        e_ant_full = np.nan_to_num(df_raw.iloc[:, 1].values.astype(float))
+
+        # Smart clip: pick the most dynamic region
+        combined = e_ant_full + e_ago_full
+        start = _find_interesting_clip(combined, clip_len)
+        end = start + clip_len
+        e_ant = e_ant_full[start:end]
+        e_ago = e_ago_full[start:end]
+        torque = alpha * e_ant - beta * e_ago
+        stiffness = e_ant + e_ago
+        t = np.arange(len(e_ant))
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
+                                 gridspec_kw={'height_ratios': [2, 1, 1]})
+        fig.suptitle(f'{cls_name}  —  samples {start}\u2013{end}  (patient: {patient_id})',
+                     fontsize=13, fontweight='bold')
+
+        # Panel 1: Agonist + Antagonist overlaid
+        ax = axes[0]
+        ax.plot(t, e_ago, color=_EMG_COLORS['agonist'], linewidth=0.8,
+                alpha=0.85, label='Agonist (E_ago)')
+        ax.plot(t, e_ant, color=_EMG_COLORS['antagonist'], linewidth=0.8,
+                alpha=0.85, label='Antagonist (E_ant)')
+        ax.fill_between(t, e_ago, e_ant, alpha=0.08, color='grey')
+        ax.set_ylabel('EMG amplitude', fontsize=10)
+        ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+        ax.set_title('Agonist \u2013 Antagonist Interaction', fontsize=11, pad=4)
+        ax.grid(True, alpha=0.2)
+        # Interpretation box
+        ax.text(0.01, 0.97,
+                'Healthy: alternating peaks (reciprocal inhibition)\n'
+                'Pathological: overlapping peaks (co-contraction)',
+                transform=ax.transAxes, fontsize=7.5, va='top',
+                bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#ccc', alpha=0.9))
+
+        # Panel 2: Torque
+        ax = axes[1]
+        ax.plot(t, torque, color=_EMG_COLORS['torque'], linewidth=0.8)
+        ax.axhline(0, color='grey', linewidth=0.5, linestyle='--')
+        ax.fill_between(t, 0, torque, where=torque >= 0,
+                        color=_EMG_COLORS['antagonist'], alpha=0.12, label='Ant-dominant')
+        ax.fill_between(t, 0, torque, where=torque < 0,
+                        color=_EMG_COLORS['agonist'], alpha=0.12, label='Ago-dominant')
+        ax.set_ylabel('Torque', fontsize=10)
+        ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+        ax.grid(True, alpha=0.2)
+        ax.text(0.01, 0.93,
+                'Clear oscillation = normal motor control\n'
+                'Flat / erratic = impaired control',
+                transform=ax.transAxes, fontsize=7.5, va='top',
+                bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#ccc', alpha=0.9))
+
+        # Panel 3: Stiffness
+        ax = axes[2]
+        ax.fill_between(t, 0, stiffness, color=_EMG_COLORS['stiffness'], alpha=0.35)
+        ax.plot(t, stiffness, color=_EMG_COLORS['stiffness'], linewidth=0.8)
+        ax.set_ylabel('Stiffness', fontsize=10)
+        ax.set_xlabel('Sample index', fontsize=10)
+        ax.grid(True, alpha=0.2)
+        ax.text(0.01, 0.93,
+                'High sustained stiffness = spasticity / co-contraction\n'
+                'Low during swing = healthy gait',
+                transform=ax.transAxes, fontsize=7.5, va='top',
+                bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#ccc', alpha=0.9))
+
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        safe = cls_name.replace(' ', '_').lower()
+        fname = f'waveform_{safe}.png'
+        fig.savefig(os.path.join(output_dir, fname), dpi=150)
+        plt.close(fig)
+        print(f'  \u2713 Saved {fname}')
+
+    # ── Multi-class comparison grid ─────────────────────────────────────
+    n_cls = len(all_classes)
+    fig, axes = plt.subplots(3, n_cls, figsize=(5 * n_cls, 9), sharex='col',
+                             gridspec_kw={'height_ratios': [2, 1, 1]})
+    if n_cls == 1:
+        axes = axes.reshape(3, 1)
+    fig.suptitle('EMG Waveform Comparison Across Classes', fontsize=14, fontweight='bold')
+
+    for col, cls_name in enumerate(all_classes):
+        file_list = classes_with_paths.get(cls_name, [])
+        if not file_list:
+            continue
+        csv_path, pid = file_list[0]
+        df_raw = pd.read_csv(csv_path, header=None)
+        e_ago_full = np.nan_to_num(df_raw.iloc[:, 0].values.astype(float))
+        e_ant_full = np.nan_to_num(df_raw.iloc[:, 1].values.astype(float))
+        start = _find_interesting_clip(e_ant_full + e_ago_full, clip_len)
+        e_ant = e_ant_full[start:start + clip_len]
+        e_ago = e_ago_full[start:start + clip_len]
+        torque = alpha * e_ant - beta * e_ago
+        stiffness = e_ant + e_ago
+        t = np.arange(len(e_ant))
+
+        # Row 0 — EMG interaction
+        ax = axes[0, col]
+        ax.plot(t, e_ago, color=_EMG_COLORS['agonist'], lw=0.6, alpha=0.8, label='Ago')
+        ax.plot(t, e_ant, color=_EMG_COLORS['antagonist'], lw=0.6, alpha=0.8, label='Ant')
+        ax.fill_between(t, e_ago, e_ant, alpha=0.06, color='grey')
+        ax.set_title(cls_name, fontsize=11, fontweight='bold')
+        if col == 0:
+            ax.set_ylabel('EMG', fontsize=10)
+        ax.legend(fontsize=7, loc='upper right')
+        ax.grid(True, alpha=0.2)
+
+        # Row 1 — Torque
+        ax = axes[1, col]
+        ax.plot(t, torque, color=_EMG_COLORS['torque'], lw=0.6)
+        ax.axhline(0, color='grey', lw=0.4, ls='--')
+        ax.fill_between(t, 0, torque, where=torque >= 0,
+                        color=_EMG_COLORS['antagonist'], alpha=0.1)
+        ax.fill_between(t, 0, torque, where=torque < 0,
+                        color=_EMG_COLORS['agonist'], alpha=0.1)
+        if col == 0:
+            ax.set_ylabel('Torque', fontsize=10)
+        ax.grid(True, alpha=0.2)
+
+        # Row 2 — Stiffness
+        ax = axes[2, col]
+        ax.fill_between(t, 0, stiffness, color=_EMG_COLORS['stiffness'], alpha=0.3)
+        ax.plot(t, stiffness, color=_EMG_COLORS['stiffness'], lw=0.6)
+        if col == 0:
+            ax.set_ylabel('Stiffness', fontsize=10)
+        ax.set_xlabel('Sample', fontsize=9)
+        ax.grid(True, alpha=0.2)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(os.path.join(output_dir, 'waveform_comparison.png'), dpi=150)
+    plt.close(fig)
+    print('  \u2713 Saved waveform_comparison.png')
+
+
+# ---------------------------------------------------------------------------
 # Convenience: run everything
 # ---------------------------------------------------------------------------
 
-def generate_all_plots(df, classes, output_dir):
+def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1.0):
     """Generate every visualisation and save to *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     print('\nGenerating EDA visualisations …')
@@ -250,4 +437,15 @@ def generate_all_plots(df, classes, output_dir):
     plot_lda(df, classes, output_dir)
     plot_feature_distributions(df, classes, output_dir)
 
-    print('✅ All plots saved to', output_dir)
+    # Signal waveforms (needs raw CSV paths)
+    if data_dir:
+        from EDA.eda_features import discover_csv_files
+        records = discover_csv_files(data_dir)
+        classes_with_paths = {}
+        for csv_path, cls_name, patient_id in records:
+            classes_with_paths.setdefault(cls_name, []).append((csv_path, patient_id))
+        plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir)
+    else:
+        print('  (Skipping waveform plots — no data_dir provided)')
+
+    print('All plots saved to', output_dir)
