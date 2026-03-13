@@ -154,11 +154,15 @@ def main():
             })
             df_patho.to_csv(os.path.join(args.data_dir, "Pathological", f"sample_{i}.csv"), index=False)
 
-    print("Initializing Data Loaders...")
-    train_loader, val_loader, test_loader, dataset = create_dataloaders(
-        args.data_dir, batch_size=args.batch_size
+    print("Initializing Data Loaders with Sliding Window...")
+    # Smaller batch size default because Mamba has state memory, but each sample is now shorter
+    train_loader, val_loader, test_loader, train_dataset = create_dataloaders(
+        args.data_dir, 
+        batch_size=args.batch_size,
+        window_size=2000,   # Slicing the 26000 sequence into 2000 frame chunks
+        base_stride=500     # Generate a new slice every 500 frames
     )
-    classes = dataset.classes
+    classes = train_dataset.classes
     num_classes = len(classes)
     print(f"Detected {num_classes} classes: {classes}")
     
@@ -166,44 +170,48 @@ def main():
     print(f"Using device: {device}")
 
     # Model Initialization
+    # Defaulting to smaller parameter footprint for 5-sample dataset robustness 
+    d_model_eff = args.d_model if args.d_model <= 32 else 32
+    n_layers_eff = args.n_layers if args.n_layers <= 2 else 2
+    
     if args.use_official_mamba:
-        print("Initializing **OFFICIAL mamba-ssm** Classifier")
+        print(f"Initializing **OFFICIAL mamba-ssm** Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = OfficialMambaGaitClassifier(
             input_dim=4,
             num_classes=num_classes,
-            d_model=args.d_model,
-            n_layers=args.n_layers
+            d_model=d_model_eff,
+            n_layers=n_layers_eff
         ).to(device)
     elif args.use_triton_mamba:
-        print("Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier")
+        print(f"Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = HardwareMambaGaitClassifier(
             input_dim=4,
             num_classes=num_classes,
-            d_model=args.d_model,
-            n_layers=args.n_layers,
+            d_model=d_model_eff,
+            n_layers=n_layers_eff,
             chunk_size=2048
         ).to(device)
     elif args.use_gru_baseline:
-        print("Initializing **BASELINE** GRU+Attention Classifier")
+        print(f"Initializing **BASELINE** GRU+Attention Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = GRUAttentionGaitClassifier(
             input_dim=4,
             num_classes=num_classes,
-            d_model=args.d_model,
+            d_model=d_model_eff,
             num_heads=4,
-            n_layers=args.n_layers
+            n_layers=n_layers_eff
         ).to(device)
     else:
         model = MambaGaitClassifier(
             input_dim=4, # [E_ant, E_ago, Torque, Stiffness]
             num_classes=num_classes,
-            d_model=args.d_model,
-            n_layers=args.n_layers
+            d_model=d_model_eff,
+            n_layers=n_layers_eff
         ).to(device)
-    
-    # Calculate class weights for imbalanced datasets
-    class_weights = dataset.get_class_weights().to(device)
+        
+    # Standard Cross Entropy Loss. 
+    # Class weights removed because Sliding Window dynamically balances the dataset batches!
     # Added label_smoothing to prevent overconfidence on the small dataset (improves generalization)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
