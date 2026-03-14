@@ -104,9 +104,13 @@ def run_evaluation(model, dataloader, device, num_classes, class_names, benchmar
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-            # Use AMP for fast inference if supported
-            amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
+            # AMP: GPU only. CPU autocast only supports bfloat16, and float16 autocast
+            # on CPU silently produces NaN/garbage — so we skip AMP entirely on CPU.
+            if device.type == 'cuda':
+                amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype):
+                    outputs = model(features, masks)
+            else:
                 outputs = model(features, masks)
 
             if device.type == 'cuda':

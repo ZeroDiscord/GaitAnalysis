@@ -240,6 +240,21 @@ _EMG_COLORS = {
 }
 
 
+def _rolling_rms(signal, window=50):
+    """
+    Compute a rolling RMS envelope.
+    RMS_i = sqrt( mean( x[i-w/2 : i+w/2]^2 ) )
+    Uses a fast cumsum approach. Output length matches input.
+    """
+    x2 = np.asarray(signal, dtype=np.float64) ** 2
+    # Pad to keep output length == input length
+    pad = window // 2
+    x2_padded = np.pad(x2, (pad, pad), mode='edge')
+    cumsum = np.cumsum(x2_padded)
+    rms = np.sqrt((cumsum[window:] - cumsum[:-window]) / window)
+    return rms[:len(signal)]
+
+
 def _find_interesting_clip(signal, clip_len=1000):
     """
     Slide a window across *signal* and return the start index of the segment
@@ -259,15 +274,16 @@ def _find_interesting_clip(signal, clip_len=1000):
 
 
 def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
-                          clip_len=1000):
+                          clip_len=1000, rms_window=50):
     """
     For each class, pick one representative patient, auto-select an
     interesting ~clip_len segment, and plot:
 
-      Panel 1  —  Agonist + Antagonist overlaid (interaction view)
-      Panel 2  —  Torque  (net activation proxy)
-      Panel 3  —  Stiffness  (co-contraction proxy, filled)
+      Panel 1  —  Agonist + Antagonist RMS envelopes overlaid (interaction view)
+      Panel 2  —  Torque RMS envelope  (net activation proxy)
+      Panel 3  —  Stiffness RMS envelope  (co-contraction proxy, filled)
 
+    Raw signals are shown as faint traces underneath for context.
     Also produces a comparison grid with one column per class.
     """
     all_classes = sorted(classes_with_paths.keys())
@@ -293,38 +309,48 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
         stiffness = e_ant + e_ago
         t = np.arange(len(e_ant))
 
+        # RMS envelopes
+        rms_ant = _rolling_rms(e_ant, rms_window)
+        rms_ago = _rolling_rms(e_ago, rms_window)
+        rms_torque = _rolling_rms(torque, rms_window)
+        rms_stiffness = _rolling_rms(stiffness, rms_window)
+
         fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
                                  gridspec_kw={'height_ratios': [2, 1, 1]})
-        fig.suptitle(f'{cls_name}  —  samples {start}\u2013{end}  (patient: {patient_id})',
-                     fontsize=13, fontweight='bold')
+        fig.suptitle(f'{cls_name}  \u2014  RMS envelope (window={rms_window})  \u2014  '
+                     f'samples {start}\u2013{end}  (patient: {patient_id})',
+                     fontsize=12, fontweight='bold')
 
-        # Panel 1: Agonist + Antagonist overlaid
+        # Panel 1: Agonist + Antagonist RMS envelopes overlaid
         ax = axes[0]
-        ax.plot(t, e_ago, color=_EMG_COLORS['agonist'], linewidth=0.8,
-                alpha=0.85, label='Agonist (E_ago)')
-        ax.plot(t, e_ant, color=_EMG_COLORS['antagonist'], linewidth=0.8,
-                alpha=0.85, label='Antagonist (E_ant)')
-        ax.fill_between(t, e_ago, e_ant, alpha=0.08, color='grey')
-        ax.set_ylabel('EMG amplitude', fontsize=10)
+        ax.plot(t, e_ago, color=_EMG_COLORS['agonist'], linewidth=0.3,
+                alpha=0.15)  # faint raw
+        ax.plot(t, e_ant, color=_EMG_COLORS['antagonist'], linewidth=0.3,
+                alpha=0.15)  # faint raw
+        ax.plot(t, rms_ago, color=_EMG_COLORS['agonist'], linewidth=1.8,
+                alpha=0.9, label='Agonist RMS')
+        ax.plot(t, rms_ant, color=_EMG_COLORS['antagonist'], linewidth=1.8,
+                alpha=0.9, label='Antagonist RMS')
+        ax.fill_between(t, rms_ago, rms_ant, alpha=0.10, color='grey')
+        ax.set_ylabel('EMG amplitude (RMS)', fontsize=10)
         ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
-        ax.set_title('Agonist \u2013 Antagonist Interaction', fontsize=11, pad=4)
+        ax.set_title('Agonist \u2013 Antagonist Interaction (RMS envelope)', fontsize=11, pad=4)
         ax.grid(True, alpha=0.2)
         # Interpretation box
         ax.text(0.01, 0.97,
                 'Healthy: alternating peaks (reciprocal inhibition)\n'
-                'Pathological: overlapping peaks (co-contraction)',
+                'Pathological: overlapping envelopes (co-contraction)',
                 transform=ax.transAxes, fontsize=7.5, va='top',
                 bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#ccc', alpha=0.9))
 
-        # Panel 2: Torque
+        # Panel 2: Torque RMS
         ax = axes[1]
-        ax.plot(t, torque, color=_EMG_COLORS['torque'], linewidth=0.8)
+        ax.plot(t, torque, color=_EMG_COLORS['torque'], linewidth=0.3, alpha=0.15)
+        ax.plot(t, rms_torque, color=_EMG_COLORS['torque'], linewidth=1.8, label='Torque RMS')
         ax.axhline(0, color='grey', linewidth=0.5, linestyle='--')
-        ax.fill_between(t, 0, torque, where=torque >= 0,
-                        color=_EMG_COLORS['antagonist'], alpha=0.12, label='Ant-dominant')
-        ax.fill_between(t, 0, torque, where=torque < 0,
-                        color=_EMG_COLORS['agonist'], alpha=0.12, label='Ago-dominant')
-        ax.set_ylabel('Torque', fontsize=10)
+        ax.fill_between(t, 0, rms_torque,
+                        color=_EMG_COLORS['torque'], alpha=0.12)
+        ax.set_ylabel('Torque (RMS)', fontsize=10)
         ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
         ax.grid(True, alpha=0.2)
         ax.text(0.01, 0.93,
@@ -333,11 +359,12 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
                 transform=ax.transAxes, fontsize=7.5, va='top',
                 bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#ccc', alpha=0.9))
 
-        # Panel 3: Stiffness
+        # Panel 3: Stiffness RMS
         ax = axes[2]
-        ax.fill_between(t, 0, stiffness, color=_EMG_COLORS['stiffness'], alpha=0.35)
-        ax.plot(t, stiffness, color=_EMG_COLORS['stiffness'], linewidth=0.8)
-        ax.set_ylabel('Stiffness', fontsize=10)
+        ax.plot(t, stiffness, color=_EMG_COLORS['stiffness'], linewidth=0.3, alpha=0.15)
+        ax.fill_between(t, 0, rms_stiffness, color=_EMG_COLORS['stiffness'], alpha=0.35)
+        ax.plot(t, rms_stiffness, color=_EMG_COLORS['stiffness'], linewidth=1.8)
+        ax.set_ylabel('Stiffness (RMS)', fontsize=10)
         ax.set_xlabel('Sample index', fontsize=10)
         ax.grid(True, alpha=0.2)
         ax.text(0.01, 0.93,
@@ -359,7 +386,7 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
                              gridspec_kw={'height_ratios': [2, 1, 1]})
     if n_cls == 1:
         axes = axes.reshape(3, 1)
-    fig.suptitle('EMG Waveform Comparison Across Classes', fontsize=14, fontweight='bold')
+    fig.suptitle('EMG Waveform Comparison (RMS Envelope)', fontsize=14, fontweight='bold')
 
     for col, cls_name in enumerate(all_classes):
         file_list = classes_with_paths.get(cls_name, [])
@@ -376,35 +403,41 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
         stiffness = e_ant + e_ago
         t = np.arange(len(e_ant))
 
-        # Row 0 — EMG interaction
+        rms_ant = _rolling_rms(e_ant, rms_window)
+        rms_ago = _rolling_rms(e_ago, rms_window)
+        rms_torque = _rolling_rms(torque, rms_window)
+        rms_stiffness = _rolling_rms(stiffness, rms_window)
+
+        # Row 0 — EMG interaction (RMS)
         ax = axes[0, col]
-        ax.plot(t, e_ago, color=_EMG_COLORS['agonist'], lw=0.6, alpha=0.8, label='Ago')
-        ax.plot(t, e_ant, color=_EMG_COLORS['antagonist'], lw=0.6, alpha=0.8, label='Ant')
-        ax.fill_between(t, e_ago, e_ant, alpha=0.06, color='grey')
+        ax.plot(t, e_ago, color=_EMG_COLORS['agonist'], lw=0.2, alpha=0.12)
+        ax.plot(t, e_ant, color=_EMG_COLORS['antagonist'], lw=0.2, alpha=0.12)
+        ax.plot(t, rms_ago, color=_EMG_COLORS['agonist'], lw=1.4, alpha=0.9, label='Ago RMS')
+        ax.plot(t, rms_ant, color=_EMG_COLORS['antagonist'], lw=1.4, alpha=0.9, label='Ant RMS')
+        ax.fill_between(t, rms_ago, rms_ant, alpha=0.08, color='grey')
         ax.set_title(cls_name, fontsize=11, fontweight='bold')
         if col == 0:
-            ax.set_ylabel('EMG', fontsize=10)
+            ax.set_ylabel('EMG (RMS)', fontsize=10)
         ax.legend(fontsize=7, loc='upper right')
         ax.grid(True, alpha=0.2)
 
-        # Row 1 — Torque
+        # Row 1 — Torque RMS
         ax = axes[1, col]
-        ax.plot(t, torque, color=_EMG_COLORS['torque'], lw=0.6)
+        ax.plot(t, torque, color=_EMG_COLORS['torque'], lw=0.2, alpha=0.12)
+        ax.plot(t, rms_torque, color=_EMG_COLORS['torque'], lw=1.4)
         ax.axhline(0, color='grey', lw=0.4, ls='--')
-        ax.fill_between(t, 0, torque, where=torque >= 0,
-                        color=_EMG_COLORS['antagonist'], alpha=0.1)
-        ax.fill_between(t, 0, torque, where=torque < 0,
-                        color=_EMG_COLORS['agonist'], alpha=0.1)
+        ax.fill_between(t, 0, rms_torque, color=_EMG_COLORS['torque'], alpha=0.1)
         if col == 0:
-            ax.set_ylabel('Torque', fontsize=10)
+            ax.set_ylabel('Torque (RMS)', fontsize=10)
         ax.grid(True, alpha=0.2)
 
-        # Row 2 — Stiffness
+        # Row 2 — Stiffness RMS
         ax = axes[2, col]
-        ax.fill_between(t, 0, stiffness, color=_EMG_COLORS['stiffness'], alpha=0.3)
-        ax.plot(t, stiffness, color=_EMG_COLORS['stiffness'], lw=0.6)
+        ax.plot(t, stiffness, color=_EMG_COLORS['stiffness'], lw=0.2, alpha=0.12)
+        ax.fill_between(t, 0, rms_stiffness, color=_EMG_COLORS['stiffness'], alpha=0.3)
+        ax.plot(t, rms_stiffness, color=_EMG_COLORS['stiffness'], lw=1.4)
         if col == 0:
-            ax.set_ylabel('Stiffness', fontsize=10)
+            ax.set_ylabel('Stiffness (RMS)', fontsize=10)
         ax.set_xlabel('Sample', fontsize=9)
         ax.grid(True, alpha=0.2)
 
