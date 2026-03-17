@@ -5,32 +5,71 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import random
+import pickle
+import hashlib
+from typing import List, Dict, Any, Optional, Tuple
+import sys
+
+from gait_phase import assign_gait_phase_continuous
+from feature_config import FeatureConfig
+
+# Import EDA feature extraction functions
+sys.path.append('EDA')
+try:
+    from EDA.eda_features import TIME_DOMAIN_FNS, _freq_features, _gait_cycle_feats, _GAIT_PHASE_AVAILABLE
+except ImportError:
+    # Fallback if EDA module not available
+    TIME_DOMAIN_FNS = {}
+    _GAIT_PHASE_AVAILABLE = False
+    def _freq_features(x, fs=1000.0):
+        return {'mean_freq': 0.0, 'spectral_entropy': 0.0, 'total_power': 0.0}
+    def _gait_cycle_feats(e_ago, e_ant, fs):
+        return {}
 
 class GaitPathologyDataset(Dataset):
     """
-    Dataset for Gait Pathology Classification using time-series muscle activations.
-    Implements Sliding Window Segmentation to multiply samples natively without data leakage,
-    Global Normalization, and Temporal Jittering.
+    Enhanced Dataset for Gait Pathology Classification using time-series muscle activations.
+    
+    Supports both legacy mode (5 features) and enhanced mode (17+ features) with:
+    - Advanced EMG feature extraction (time-domain, frequency-domain, gait cycle)
+    - Sliding Window Segmentation with patient-level splitting
+    - Feature caching for performance optimization
+    - Dimensionality reduction integration
+    - Global Normalization and Temporal Jittering
     """
-    def __init__(self, file_paths, labels, class_to_idx, alpha=1.0, beta=1.0, 
+    def __init__(self, file_paths, labels, class_to_idx, 
+                 feature_config: Optional[FeatureConfig] = None,
+                 alpha=1.0, beta=1.0, 
                  window_size=2000, base_stride=1000, mode='train', 
-                 global_mean=None, global_std=None, balance_classes=True):
+                 global_mean=None, global_std=None, balance_classes=True,
+                 fs=1000.0):
         """
         Args:
             file_paths: List of absolute paths to CSV files.
             labels: List of integer labels corresponding to `file_paths`.
             class_to_idx: Dictionary mapping class name to integer.
+            feature_config: Configuration for advanced features (None = legacy mode)
             alpha, beta: Coefficients for Torque physics feature.
             window_size: Length of each extracted sub-sequence.
             base_stride: How much to shift the window.
             mode: 'train', 'val', or 'test'. Used to enable temporal jittering and control stride.
             global_mean, global_std: Normalization statistics pre-calculated from train set.
             balance_classes: If true, adjusts stride dynamically per file to explicitly balance the dataset.
+            fs: Sampling frequency for frequency-domain features.
         """
+        # Initialize configuration (legacy mode if None)
+        if feature_config is None:
+            self.feature_config = FeatureConfig.create_legacy()
+            self.legacy_mode = True
+        else:
+            self.feature_config = feature_config
+            self.legacy_mode = feature_config.legacy_mode
+        
         self.alpha = alpha
         self.beta = beta
         self.window_size = window_size
         self.mode = mode
+        self.fs = fs
         
         self.global_mean = global_mean
         self.global_std = global_std
@@ -38,21 +77,17 @@ class GaitPathologyDataset(Dataset):
         self.classes = sorted(list(class_to_idx.keys()))
         self.num_classes = len(self.classes)
         
-        # 1. First, load all base patient files and compute physics features immediately
+        # Initialize cache directory for enhanced features
+        if not self.legacy_mode and self.feature_config.enable_feature_caching:
+            os.makedirs(self.feature_config.cache_dir, exist_ok=True)
+        
+        # Enhanced feature extraction for base samples
         self.base_samples = []
         for path, label in zip(file_paths, labels):
-            df = pd.read_csv(path, header=None)
-            e_ago = df.iloc[:, 0].values  # Agonist is column 0
-            e_ant = df.iloc[:, 1].values  # Antagonist is column 1
-            
-            torque = self.alpha * e_ant - self.beta * e_ago
-            stiffness = e_ant + e_ago
-            
-            features = np.column_stack((e_ant, e_ago, torque, stiffness))
-            features = torch.tensor(features, dtype=torch.float32)
-            
-            # Clean corrupt data
-            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.legacy_mode:
+                features = self._extract_legacy_features(path)
+            else:
+                features = self._load_or_compute_features(path, label)
             
             self.base_samples.append({
                 'features': features,
@@ -226,10 +261,14 @@ def manual_stratified_split(file_paths, labels, val_split=0.2, test_split=0.1, r
                 
     return (train_paths, train_labels), (val_paths, val_labels), (test_paths, test_labels)
 
-def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=1000, random_seed=42):
+def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=1000, random_seed=42, 
+                      feature_config: Optional[FeatureConfig] = None):
     """
     Utility function to create separate train, validation, and test dataloaders
     using Sliding Windows and Strict Patient-Level Splitting.
+    
+    Args:
+        feature_config: Configuration for enhanced features (None = legacy mode)
     """
     raw_folders = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
     discovered_classes = set()
@@ -263,6 +302,7 @@ def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=10
     # 2. Initialize datasets. Train set calculates Global Norm natively!
     train_dataset = GaitPathologyDataset(
         train_p, train_l, class_to_idx, 
+        feature_config=feature_config,
         window_size=window_size, base_stride=base_stride, mode='train',
         balance_classes=True
     )
@@ -273,12 +313,14 @@ def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=10
     
     val_dataset = GaitPathologyDataset(
         val_p, val_l, class_to_idx, 
+        feature_config=feature_config,
         window_size=window_size, base_stride=base_stride, mode='val',
         global_mean=g_mean, global_std=g_std, balance_classes=False
     )
     
     test_dataset = GaitPathologyDataset(
         test_p, test_l, class_to_idx, 
+        feature_config=feature_config,
         window_size=window_size, base_stride=base_stride, mode='test',
         global_mean=g_mean, global_std=g_std, balance_classes=False
     )
@@ -292,3 +334,212 @@ def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=10
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_pad)
     
     return train_loader, val_loader, test_loader, train_dataset
+
+    def _extract_legacy_features(self, file_path: str) -> torch.Tensor:
+        """Extract legacy 5-channel features (original pipeline)."""
+        df = pd.read_csv(file_path, header=None)
+        e_ago = df.iloc[:, 0].values  # TA (Tibialis Anterior) — col 0
+        e_ant = df.iloc[:, 1].values  # GA (Gastrocnemius)     — col 1
+        
+        torque = self.alpha * e_ant - self.beta * e_ago
+        stiffness = e_ant + e_ago
+        
+        # Gait Phase: TKEO + EMG burst detection → continuous [0, 100] per timestep
+        try:
+            gait_phase = assign_gait_phase_continuous(e_ago, e_ant)
+        except Exception:
+            # Graceful fallback if signal is too short or degenerate
+            gait_phase = np.linspace(0.0, 100.0, len(e_ago), dtype=np.float32)
+        
+        # Stack all 5 channels: [e_ant, e_ago, torque, stiffness, gait_phase]
+        features = np.column_stack((e_ant, e_ago, torque, stiffness, gait_phase))
+        features = torch.tensor(features, dtype=torch.float32)
+        
+        # Clean corrupt data
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return features
+
+    def _get_cache_path(self, file_path: str) -> str:
+        """Get cache file path for a given input file."""
+        if not self.feature_config.enable_feature_caching:
+            return None
+        
+        # Create unique cache filename based on input file and config
+        file_hash = hashlib.md5(file_path.encode()).hexdigest()[:8]
+        config_hash = self.feature_config.get_config_hash()
+        cache_filename = f"{os.path.basename(file_path)}_{file_hash}_{config_hash}.npz"
+        return os.path.join(self.feature_config.cache_dir, cache_filename)
+    
+    def _load_or_compute_features(self, file_path: str, label: int) -> torch.Tensor:
+        """Load cached features or compute and cache new ones."""
+        cache_path = self._get_cache_path(file_path)
+        
+        # Try to load from cache first
+        if cache_path and os.path.exists(cache_path):
+            try:
+                cached_data = np.load(cache_path)
+                features = torch.tensor(cached_data['features'], dtype=torch.float32)
+                return features
+            except Exception as e:
+                print(f"Cache load failed for {file_path}: {e}. Recomputing...")
+        
+        # Compute features from scratch
+        features = self._extract_enhanced_features(file_path)
+        
+        # Cache the computed features
+        if cache_path:
+            try:
+                np.savez_compressed(cache_path, features=features.numpy())
+            except Exception as e:
+                print(f"Cache save failed for {file_path}: {e}")
+        
+        return features
+    
+    def _extract_enhanced_features(self, file_path: str) -> torch.Tensor:
+        """Extract enhanced features from a single CSV file."""
+        # Load raw EMG data
+        df = pd.read_csv(file_path, header=None)
+        e_ago = df.iloc[:, 0].values.astype(np.float64)  # TA (Tibialis Anterior)
+        e_ant = df.iloc[:, 1].values.astype(np.float64)  # GA (Gastrocnemius)
+        
+        # Clean corrupt data
+        e_ant = np.nan_to_num(e_ant, nan=0.0, posinf=0.0, neginf=0.0)
+        e_ago = np.nan_to_num(e_ago, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        sequence_length = len(e_ant)
+        all_features = []
+        
+        # Base features (if enabled)
+        if self.feature_config.include_base_features:
+            # Physics-informed features
+            torque = self.alpha * e_ant - self.beta * e_ago
+            stiffness = e_ant + e_ago
+            
+            # Gait phase
+            try:
+                gait_phase = assign_gait_phase_continuous(e_ago, e_ant, self.fs)
+            except Exception:
+                gait_phase = np.linspace(0.0, 100.0, sequence_length, dtype=np.float32)
+            
+            # Stack base features: [e_ant, e_ago, torque, stiffness, gait_phase]
+            base_features = np.column_stack((e_ant, e_ago, torque, stiffness, gait_phase))
+            all_features.append(base_features)
+        
+        # Advanced features are computed per-window and then broadcast to sequence length
+        advanced_features = self._extract_advanced_features_per_sequence(e_ant, e_ago)
+        
+        if advanced_features.size > 0:
+            # Broadcast advanced features to match sequence length
+            advanced_features_broadcast = np.tile(advanced_features, (sequence_length, 1))
+            all_features.append(advanced_features_broadcast)
+        
+        # Concatenate all features
+        if all_features:
+            features = np.concatenate(all_features, axis=1)
+        else:
+            # Fallback to base features only
+            torque = self.alpha * e_ant - self.beta * e_ago
+            stiffness = e_ant + e_ago
+            gait_phase = np.linspace(0.0, 100.0, sequence_length, dtype=np.float32)
+            features = np.column_stack((e_ant, e_ago, torque, stiffness, gait_phase))
+        
+        # Convert to tensor and clean
+        features = torch.tensor(features, dtype=torch.float32)
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return features
+    
+    def _extract_advanced_features_per_sequence(self, e_ant: np.ndarray, e_ago: np.ndarray) -> np.ndarray:
+        """Extract advanced features for an entire sequence (to be broadcast per timestep)."""
+        features = []
+        
+        # Time-domain features
+        if self.feature_config.include_time_domain:
+            channels = {'ant': e_ant, 'ago': e_ago}
+            for ch_name, ch_data in channels.items():
+                for feat_name in self.feature_config.time_domain_features:
+                    if feat_name.endswith(f'_{ch_name}'):
+                        base_feat_name = feat_name.replace(f'_{ch_name}', '')
+                        if base_feat_name in TIME_DOMAIN_FNS:
+                            feat_value = TIME_DOMAIN_FNS[base_feat_name](ch_data)
+                            features.append(feat_value)
+        
+        # Frequency-domain features
+        if self.feature_config.include_freq_domain:
+            channels = {'ant': e_ant, 'ago': e_ago}
+            for ch_name, ch_data in channels.items():
+                freq_feats = _freq_features(ch_data, fs=self.fs)
+                for feat_name in self.feature_config.freq_domain_features:
+                    if feat_name.endswith(f'_{ch_name}'):
+                        base_feat_name = feat_name.replace(f'_{ch_name}', '')
+                        if base_feat_name in freq_feats:
+                            features.append(freq_feats[base_feat_name])
+        
+        # Gait cycle features
+        if self.feature_config.include_gait_cycle and _GAIT_PHASE_AVAILABLE:
+            try:
+                gait_feats = _gait_cycle_feats(e_ago, e_ant, self.fs)
+                for feat_name in self.feature_config.gait_cycle_features:
+                    gait_key = feat_name.replace('gp_', '')
+                    if gait_key in gait_feats and isinstance(gait_feats[gait_key], (int, float)):
+                        features.append(float(gait_feats[gait_key]))
+            except Exception:
+                # Add zeros for gait cycle features if extraction fails
+                features.extend([0.0] * len(self.feature_config.gait_cycle_features))
+        
+        return np.array(features, dtype=np.float32)
+    
+    def get_feature_names(self) -> List[str]:
+        """Get list of all feature names in the order they appear in the feature vector."""
+        if self.legacy_mode:
+            return ['e_ant', 'e_ago', 'torque', 'stiffness', 'gait_phase']
+        return self.feature_config.get_enabled_features()
+    
+    def get_feature_count(self) -> int:
+        """Get total number of features per timestep."""
+        if self.legacy_mode:
+            return 5
+        return self.feature_config.get_total_feature_count()
+
+    def __len__(self):
+        return len(self.windows)
+        
+    def __getitem__(self, idx):
+        window = self.windows[idx]
+        parent = window['parent_feat']
+        start = window['start']
+        lbl = window['label']
+        
+        end = start + self.window_size
+        
+        # Temporal Jittering (Data Augmentation for robust Phase Invariance)
+        if self.mode == 'train':
+            # Randomly shift the window boundary by up to +/- 5% of the window size
+            jitter = int(self.window_size * 0.05)
+            shift = random.randint(-jitter, jitter)
+            
+            # Ensure we don't index out of bounds
+            new_start = max(0, start + shift)
+            new_end = new_start + self.window_size
+            
+            # If shift pushes us past the end, pull it back
+            if new_end > parent.size(0):
+                new_end = parent.size(0)
+                new_start = max(0, new_end - self.window_size)
+                
+            window_feat = parent[new_start:new_end]
+            
+            # Additional Feature Augmentation: Random Scaling
+            scale_factor = random.uniform(0.9, 1.1)
+            window_feat = window_feat * scale_factor
+        else:
+            window_feat = parent[start:end]
+            
+        # Global Normalization (Applied IDENTICALLY to Val/Test using Training Stats)
+        window_feat = (window_feat - self.global_mean) / (self.global_std + 1e-8)
+        
+        # Hard clamp extreme outliers (prevents nan loss spikes from exploding gradients)
+        window_feat = torch.clamp(window_feat, min=-10.0, max=10.0)
+            
+        return window_feat, torch.tensor(lbl, dtype=torch.long)

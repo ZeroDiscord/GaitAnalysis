@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 from scipy.spatial import ConvexHull
 import seaborn as sns
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, FastICA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.preprocessing import StandardScaler
 
@@ -169,6 +169,40 @@ def plot_lda(df, classes, output_dir):
     fig.savefig(os.path.join(output_dir, 'lda_projection.png'), dpi=150)
     plt.close(fig)
     print('  ✓ Saved lda_projection.png')
+
+
+# ---------------------------------------------------------------------------
+# ICA projection
+# ---------------------------------------------------------------------------
+
+def plot_ica(df, classes, output_dir, n_components=2):
+    feat_cols = _get_feature_columns(df)
+    X = df[feat_cols].values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = StandardScaler().fit_transform(X)
+
+    ica = FastICA(n_components=n_components, random_state=42, max_iter=1000)
+    try:
+        components = ica.fit_transform(X)
+    except Exception as e:
+        print(f'  Warning: ICA failed ({e}), skipping.')
+        return
+
+    palette = _class_palette(classes)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for cls in classes:
+        mask = df['class_name'].values == cls
+        ax.scatter(components[mask, 0], components[mask, 1],
+                   label=cls, alpha=0.6, s=30, color=palette[cls], edgecolors='w', linewidths=0.3)
+    ax.set_xlabel('IC1', fontsize=12)
+    ax.set_ylabel('IC2', fontsize=12)
+    ax.set_title('ICA Projection (IC1 vs IC2)', fontsize=14)
+    ax.legend(title='Class', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'ica_projection.png'), dpi=150)
+    plt.close(fig)
+    print('  ✓ Saved ica_projection.png')
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +485,205 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
 # Convenience: run everything
 # ---------------------------------------------------------------------------
 
+def plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir, fs=1000.0, clip_len=2000):
+    """
+    For each class, plot:
+      Panel 1 — TA + GA RMS envelopes (raw EMG activity)
+      Panel 2 — Continuous gait_phase [0, 100] colored by phase region
+
+    Phase color bands:
+      Heel Strike / Loading (0–12%)   → Orange  (#FF6D00)
+      Midstance / Terminal (12–62%)   → Green   (#00C853)
+      Pre-Swing / Toe-Off  (62–75%)   → Purple  (#AA00FF)
+      Swing                (75–100%)  → Teal    (#00B0FF)
+
+    Also saves a multi-class comparison grid: gait_phase_comparison.png
+    """
+    try:
+        import sys, os as _os
+        sys.path.insert(0, _os.path.dirname(_os.path.dirname(__file__)))
+        from gait_phase import assign_gait_phase_continuous, emg_envelope, FSM_STATES
+    except ImportError:
+        print('  ⚠ gait_phase module not found — skipping gait phase overlay plots.')
+        return
+
+    # Cyclic colormap: interpolate phase 0–100 into RGBA
+    _PHASE_COLORS = [
+        (0,   '#FF6D00'),   # Heel Strike         0–12%
+        (12,  '#00C853'),   # Midstance           12–62%
+        (62,  '#AA00FF'),   # Pre-Swing           62–75%
+        (75,  '#00B0FF'),   # Swing               75–100%
+        (100, '#FF6D00'),   # Wrap around
+    ]
+
+    def _phase_color(pct):
+        """Map a gait phase percentage to an RGBA colour."""
+        import matplotlib.colors as mcolors
+        for i in range(len(_PHASE_COLORS) - 1):
+            lo_pct, lo_col = _PHASE_COLORS[i]
+            hi_pct, hi_col = _PHASE_COLORS[i + 1]
+            if lo_pct <= pct <= hi_pct:
+                t = (pct - lo_pct) / max(hi_pct - lo_pct, 1e-6)
+                lo_rgba = np.array(mcolors.to_rgba(lo_col))
+                hi_rgba = np.array(mcolors.to_rgba(hi_col))
+                return tuple(lo_rgba * (1 - t) + hi_rgba * t)
+        return mcolors.to_rgba(_PHASE_COLORS[-1][1])
+
+    all_classes = sorted(classes_with_paths.keys())
+
+    # ── Individual per-class plots ─────────────────────────────────────────
+    for cls_name in all_classes:
+        file_list = classes_with_paths.get(cls_name, [])
+        if not file_list:
+            continue
+
+        csv_path, patient_id = file_list[0]
+        df_raw = pd.read_csv(csv_path, header=None)
+        e_ta_full = np.nan_to_num(df_raw.iloc[:, 0].values.astype(float))
+        e_ga_full = np.nan_to_num(df_raw.iloc[:, 1].values.astype(float))
+
+        # Pick most dynamic clip
+        start = _find_interesting_clip(e_ta_full + e_ga_full, clip_len)
+        e_ta = e_ta_full[start:start + clip_len]
+        e_ga = e_ga_full[start:start + clip_len]
+        t = np.arange(len(e_ta))
+
+        # Compute envelopes for visualization
+        ta_env = _rolling_rms(np.abs(e_ta), 50)
+        ga_env = _rolling_rms(np.abs(e_ga), 50)
+
+        # Compute gait phase
+        gait_phase = assign_gait_phase_continuous(e_ta, e_ga, fs)
+
+        # Detect cycle boundaries for vertical dashed lines (approx from phase resets)
+        phase_diff = np.diff(gait_phase)
+        cycle_boundaries = np.where(phase_diff < -50)[0]  # Large drops = new cycle
+
+        fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                                  gridspec_kw={'height_ratios': [2, 1]})
+        fig.suptitle(
+            f'{cls_name} — Gait Phase Overlay  (patient: {patient_id})',
+            fontsize=13, fontweight='bold'
+        )
+
+        # --- Panel 1: EMG Envelopes ---
+        ax = axes[0]
+        ax.plot(t, e_ta, color='#2196F3', lw=0.3, alpha=0.15)
+        ax.plot(t, e_ga, color='#F44336', lw=0.3, alpha=0.15)
+        ax.plot(t, ta_env, color='#2196F3', lw=1.8, label='TA (Tibialis Anterior) RMS')
+        ax.plot(t, ga_env, color='#F44336', lw=1.8, label='GA (Gastrocnemius) RMS')
+        ax.fill_between(t, ta_env, ga_env, alpha=0.08, color='grey', label='Co-activation zone')
+
+        for cb in cycle_boundaries:
+            ax.axvline(cb, color='grey', lw=0.8, linestyle='--', alpha=0.6)
+
+        ax.set_ylabel('EMG Amplitude (RMS)', fontsize=10)
+        ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+        ax.grid(True, alpha=0.2)
+        ax.text(0.01, 0.96,
+                'Each dashed line = detected gait cycle boundary',
+                transform=ax.transAxes, fontsize=7.5, va='top',
+                bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#ccc', alpha=0.9))
+
+        # --- Panel 2: Gait Phase colored line ---
+        ax = axes[1]
+        # Plot phase as colored segments
+        for i in range(len(t) - 1):
+            color = _phase_color(float(gait_phase[i]))
+            ax.plot(t[i:i+2], gait_phase[i:i+2], color=color, lw=2.2, solid_capstyle='round')
+
+        for cb in cycle_boundaries:
+            ax.axvline(cb, color='grey', lw=0.8, linestyle='--', alpha=0.6)
+
+        ax.set_yticks([0, 12, 62, 75, 100])
+        ax.set_yticklabels(['Heel\nStrike', 'Stance\nStart', 'Toe-\nOff', 'Swing\nStart', 'Cycle\nEnd'],
+                            fontsize=7)
+        ax.set_ylim(-5, 108)
+        ax.set_ylabel('Gait Phase (%)', fontsize=10)
+        ax.set_xlabel('Sample Index', fontsize=10)
+        ax.grid(True, alpha=0.2)
+
+        # Phase legend patches
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#FF6D00', label='Heel Strike / Loading (0–12%)'),
+            Patch(facecolor='#00C853', label='Stance (12–62%)'),
+            Patch(facecolor='#AA00FF', label='Pre-Swing / Toe-Off (62–75%)'),
+            Patch(facecolor='#00B0FF', label='Swing (75–100%)'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=7.5,
+                  framealpha=0.95, ncol=2)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        safe = cls_name.replace(' ', '_').lower()
+        fname = f'gait_phase_{safe}.png'
+        fig.savefig(os.path.join(output_dir, fname), dpi=150)
+        plt.close(fig)
+        print(f'  ✓ Saved {fname}')
+
+    # ── Multi-class comparison grid ────────────────────────────────────────
+    n_cls = len(all_classes)
+    if n_cls == 0:
+        return
+
+    fig, axes = plt.subplots(2, n_cls, figsize=(5 * n_cls, 7), sharex='col',
+                              gridspec_kw={'height_ratios': [2, 1]})
+    if n_cls == 1:
+        axes = axes.reshape(2, 1)
+    fig.suptitle('Gait Phase Comparison Across Classes', fontsize=14, fontweight='bold')
+
+    for col, cls_name in enumerate(all_classes):
+        file_list = classes_with_paths.get(cls_name, [])
+        if not file_list:
+            continue
+        csv_path, pid = file_list[0]
+        df_raw = pd.read_csv(csv_path, header=None)
+        e_ta = np.nan_to_num(df_raw.iloc[:, 0].values.astype(float))
+        e_ga = np.nan_to_num(df_raw.iloc[:, 1].values.astype(float))
+        start = _find_interesting_clip(e_ta + e_ga, clip_len)
+        e_ta = e_ta[start:start + clip_len]
+        e_ga = e_ga[start:start + clip_len]
+        t = np.arange(len(e_ta))
+
+        ta_env = _rolling_rms(np.abs(e_ta), 50)
+        ga_env = _rolling_rms(np.abs(e_ga), 50)
+        gait_phase = assign_gait_phase_continuous(e_ta, e_ga, fs)
+        cycle_boundaries = np.where(np.diff(gait_phase) < -50)[0]
+
+        # Row 0 — EMG envelopes
+        ax = axes[0, col]
+        ax.plot(t, ta_env, color='#2196F3', lw=1.4, label='TA')
+        ax.plot(t, ga_env, color='#F44336', lw=1.4, label='GA')
+        ax.fill_between(t, ta_env, ga_env, alpha=0.08, color='grey')
+        for cb in cycle_boundaries:
+            ax.axvline(cb, color='grey', lw=0.6, linestyle='--', alpha=0.5)
+        ax.set_title(cls_name, fontsize=11, fontweight='bold')
+        if col == 0:
+            ax.set_ylabel('EMG (RMS)', fontsize=9)
+        ax.legend(fontsize=7, loc='upper right')
+        ax.grid(True, alpha=0.2)
+
+        # Row 1 — Gait phase
+        ax = axes[1, col]
+        for i in range(len(t) - 1):
+            color = _phase_color(float(gait_phase[i]))
+            ax.plot(t[i:i+2], gait_phase[i:i+2], color=color, lw=2.0, solid_capstyle='round')
+        for cb in cycle_boundaries:
+            ax.axvline(cb, color='grey', lw=0.6, linestyle='--', alpha=0.5)
+        ax.set_yticks([0, 62, 100])
+        ax.set_yticklabels(['0%', '62%', '100%'], fontsize=7)
+        ax.set_ylim(-5, 108)
+        if col == 0:
+            ax.set_ylabel('Gait Phase (%)', fontsize=9)
+        ax.set_xlabel('Sample', fontsize=8)
+        ax.grid(True, alpha=0.2)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(os.path.join(output_dir, 'gait_phase_comparison.png'), dpi=150)
+    plt.close(fig)
+    print('  ✓ Saved gait_phase_comparison.png')
+
+
 def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1.0):
     """Generate every visualisation and save to *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
@@ -468,9 +701,10 @@ def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1
     plot_correlation_heatmap(df, output_dir)
     plot_pca(df, classes, output_dir)
     plot_lda(df, classes, output_dir)
+    plot_ica(df, classes, output_dir)
     plot_feature_distributions(df, classes, output_dir)
 
-    # Signal waveforms (needs raw CSV paths)
+    # Signal waveforms + gait phase overlay (needs raw CSV paths)
     if data_dir:
         from EDA.eda_features import discover_csv_files
         records = discover_csv_files(data_dir)
@@ -478,7 +712,9 @@ def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1
         for csv_path, cls_name, patient_id in records:
             classes_with_paths.setdefault(cls_name, []).append((csv_path, patient_id))
         plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir)
+        plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir)
     else:
-        print('  (Skipping waveform plots — no data_dir provided)')
+        print('  (Skipping waveform/gait-phase plots — no data_dir provided)')
 
     print('All plots saved to', output_dir)
+

@@ -8,9 +8,18 @@ Does NOT import or modify dataset.py — replicates the same logic for independe
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
+
+# Gait phase module (lives one level up from EDA/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from gait_phase import extract_gait_cycle_features as _gait_cycle_feats
+    _GAIT_PHASE_AVAILABLE = True
+except ImportError:
+    _GAIT_PHASE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +152,8 @@ FREQ_FEATURE_NAMES = ['mean_freq', 'median_freq', 'spectral_entropy', 'peak_freq
 
 def _extract_window_features(e_ant_win, e_ago_win, alpha, beta, fs=1000.0):
     """
-    Given a single window of e_ant / e_ago values, compute ALL features and
-    return a flat dict.
+    Given a single window of e_ant (GA) / e_ago (TA) values, compute ALL features and
+    return a flat dict including gait cycle phase features.
     """
     row = {}
 
@@ -168,6 +177,18 @@ def _extract_window_features(e_ant_win, e_ago_win, alpha, beta, fs=1000.0):
         freq_feats = _freq_features(ch_data, fs=fs)
         for feat_name, val in freq_feats.items():
             row[f'{feat_name}_{ch_name}'] = val
+
+    # Gait cycle phase features (TA = e_ago col0, GA = e_ant col1)
+    if _GAIT_PHASE_AVAILABLE:
+        try:
+            phase_feats = _gait_cycle_feats(e_ago_win, e_ant_win, fs)
+            # Flatten: prefix with 'gp_', skip non-numeric fields
+            for k, v in phase_feats.items():
+                if k == 'method':
+                    continue
+                row[f'gp_{k}'] = float(v)
+        except Exception:
+            pass  # Silently skip if window too short for gait phase
 
     return row
 

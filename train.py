@@ -6,7 +6,9 @@ from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_
 import argparse
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 from dataset import create_dataloaders
+from feature_config import FeatureConfig
 from models.native_mamba import MambaGaitClassifier
 from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
@@ -139,7 +141,7 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
                     labels=valid_classes
                 )
     except Exception as e:
-        auc = 0.0 # Extreme fallback if entirely mathematically impossible
+        auc = 0.0
         
     cm = confusion_matrix(all_labels, all_preds)
 
@@ -158,7 +160,38 @@ def main():
     parser.add_argument('--use_official_mamba', action='store_true', help='Use the official mamba-ssm package (requires causal-conv1d and mamba-ssm to be pip installed)')
     parser.add_argument('--use_gru_baseline', action='store_true', help='Use the GRU+Attention baseline model instead of Mamba for comparison')
     parser.add_argument('--output_name', type=str, default='best_model.pth', help='Filename to save the best model weights (e.g., mamba_best.pth)')
+    
+    # Enhanced feature arguments
+    parser.add_argument('--enhanced_features', action='store_true', help='Use enhanced feature extraction (17+ features)')
+    parser.add_argument('--legacy_mode', action='store_true', help='Force legacy mode (5 features) even with enhanced_features flag')
+    parser.add_argument('--enable_pca', action='store_true', help='Enable PCA dimensionality reduction')
+    parser.add_argument('--pca_components', type=int, default=10, help='Number of PCA components')
+    parser.add_argument('--enable_ica', action='store_true', help='Enable ICA dimensionality reduction')
+    parser.add_argument('--ica_components', type=int, default=8, help='Number of ICA components')
+    
     args = parser.parse_args()
+
+    # Configure feature extraction
+    if args.enhanced_features and not args.legacy_mode:
+        feature_config = FeatureConfig(
+            legacy_mode=False,
+            include_base_features=True,
+            include_time_domain=True,
+            include_freq_domain=True,
+            include_gait_cycle=True,
+            enable_pca=args.enable_pca,
+            pca_components=args.pca_components,
+            enable_ica=args.enable_ica,
+            ica_components=args.ica_components,
+            enable_feature_caching=True
+        )
+        print("Using Enhanced Feature Mode:")
+        print(f"  - Total features: {feature_config.get_total_feature_count()}")
+        print(f"  - PCA: {'Enabled' if args.enable_pca else 'Disabled'}")
+        print(f"  - ICA: {'Enabled' if args.enable_ica else 'Disabled'}")
+    else:
+        feature_config = None
+        print("Using Legacy Feature Mode (5 features)")
 
     # Create dummy data if folder doesn't exist or is empty just for testing pipeline setup
     has_data = False
@@ -171,8 +204,8 @@ def main():
                 
     if not has_data:
         print(f"Creating dummy dataset at {args.data_dir} for testing...")
-        os.makedirs(os.path.join(args.data_dir, "Normal"), exist_ok=True)
-        os.makedirs(os.path.join(args.data_dir, "Pathological"), exist_ok=True)
+        os.makedirs(os.path.join(args.data_dir, "01_Normal"), exist_ok=True)
+        os.makedirs(os.path.join(args.data_dir, "02_Pathological"), exist_ok=True)
         
         # Generate some random dummy CSVs (representing E_ant and E_ago time series)
         for i in range(20):
@@ -182,14 +215,14 @@ def main():
                 'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len),
                 'E_ago': np.cos(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len)
             })
-            df_norm.to_csv(os.path.join(args.data_dir, "Normal", f"sample_{i}.csv"), index=False)
+            df_norm.to_csv(os.path.join(args.data_dir, "01_Normal", f"sample_{i}.csv"), index=False, header=False)
             
             df_patho = pd.DataFrame({
                 # Pathological: Co-contraction (high overlap)
                 'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len),
                 'E_ago': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len)
             })
-            df_patho.to_csv(os.path.join(args.data_dir, "Pathological", f"sample_{i}.csv"), index=False)
+            df_patho.to_csv(os.path.join(args.data_dir, "02_Pathological", f"sample_{i}.csv"), index=False, header=False)
 
     print("Initializing Data Loaders with Sliding Window...")
     # Smaller batch size default because Mamba has state memory, but each sample is now shorter
@@ -197,11 +230,16 @@ def main():
         args.data_dir, 
         batch_size=args.batch_size,
         window_size=2000,   # Slicing the 26000 sequence into 2000 frame chunks
-        base_stride=1000     # Generate a new slice every 500 frames
+        base_stride=1000,   # Generate a new slice every 1000 frames
+        feature_config=feature_config
     )
     classes = train_dataset.classes
     num_classes = len(classes)
     print(f"Detected {num_classes} classes: {classes}")
+    
+    # Get actual input dimension from dataset
+    input_dim = train_dataset.get_feature_count()
+    print(f"Input dimension: {input_dim} features per timestep")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -214,7 +252,7 @@ def main():
     if args.use_official_mamba:
         print(f"Initializing **OFFICIAL mamba-ssm** Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = OfficialMambaGaitClassifier(
-            input_dim=4,
+            input_dim=5,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff
@@ -222,7 +260,7 @@ def main():
     elif args.use_triton_mamba:
         print(f"Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = HardwareMambaGaitClassifier(
-            input_dim=4,
+            input_dim=5,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff,
@@ -231,7 +269,7 @@ def main():
     elif args.use_gru_baseline:
         print(f"Initializing **BASELINE** GRU+Attention Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = GRUAttentionGaitClassifier(
-            input_dim=4,
+            input_dim=5,
             num_classes=num_classes,
             d_model=d_model_eff,
             num_heads=4,
@@ -239,7 +277,7 @@ def main():
         ).to(device)
     else:
         model = MambaGaitClassifier(
-            input_dim=4, # [E_ant, E_ago, Torque, Stiffness]
+            input_dim=5,  # [GA/e_ant, TA/e_ago, Torque, Stiffness, GaitPhase]
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff

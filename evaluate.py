@@ -8,32 +8,33 @@ import seaborn as sns
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 
 from dataset import create_dataloaders
+from feature_config import FeatureConfig
 from models.native_mamba import MambaGaitClassifier
 from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-def load_model(args, num_classes, device):
+def load_model(args, input_dim, num_classes, device):
     """Initializes the correct model architecture based on flags."""
     if args.use_official_mamba:
         print("Loading **OFFICIAL mamba-ssm** Classifier...")
         model = OfficialMambaGaitClassifier(
-            input_dim=4, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers
         )
     elif args.use_triton_mamba:
         print("Loading **HARDWARE-ACCELERATED** Triton Mamba Classifier...")
         model = HardwareMambaGaitClassifier(
-            input_dim=4, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers, chunk_size=2048
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers, chunk_size=2048
         )
     elif args.use_gru_baseline:
         print("Loading **BASELINE** GRU+Attention Classifier...")
         model = GRUAttentionGaitClassifier(
-            input_dim=4, num_classes=num_classes, d_model=args.d_model, num_heads=4, n_layers=args.n_layers
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, num_heads=4, n_layers=args.n_layers
         )
     else:
         print("Loading **NATIVE PYTORCH** Mamba Classifier...")
         model = MambaGaitClassifier(
-            input_dim=4, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers
         )
         
     # Load weights
