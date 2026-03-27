@@ -1,3 +1,5 @@
+***Note: Run `train.py` with the `--enhanced_features` flag to use all 22 top features***
+---
 # Biomechanics-Informed Gait Pathology Classification
 
 > **A PyTorch pipeline using hardware-accelerated Mamba SSMs and physics-informed EMG features to classify clinical gait pathologies from extreme-length time-series.**
