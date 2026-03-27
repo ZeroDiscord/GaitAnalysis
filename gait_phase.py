@@ -26,6 +26,7 @@ Column mapping (matches dataset.py convention):
 """
 
 import numpy as np
+from typing import Optional
 from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
 
 # ---------------------------------------------------------------------------
@@ -97,7 +98,7 @@ def _bandpass(x: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
     hi_n = min(hi / nyq, 1.0 - 1e-4)
     if lo_n >= hi_n:
         return x
-    b, a = butter(4, [lo_n, hi_n], btype='band')
+    b, a = butter(4, [lo_n, hi_n], btype='band', output='ba')  # type: ignore[misc]
     if len(x) < 27:          # filtfilt minimum length guard
         return np.abs(x)
     return filtfilt(b, a, x)
@@ -186,7 +187,7 @@ def emg_envelope(x: np.ndarray, fs: float = _FS_DEFAULT) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def detect_bursts_threshold(envelope: np.ndarray,
-                            threshold: float = None,
+                            threshold: Optional[float] = None,
                             min_gap_samples: int = 50) -> list[dict]:
     """
     Locate activation bursts using a MAD-based adaptive threshold.

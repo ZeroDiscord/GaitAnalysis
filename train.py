@@ -30,7 +30,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
 
         # Select AMP dtype: bfloat16 on H100 (no scaler needed), float16 elsewhere
         amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-        with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
+        with torch.cuda.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):  # type: ignore[attr-defined]
             outputs = model(features, masks)
             loss = criterion(outputs, labels) / accum_steps
         
@@ -74,7 +74,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
     total_samples = len(dataloader.dataset) - nan_batches * dataloader.batch_size
     epoch_loss = running_loss / max(total_samples, 1)
     epoch_acc = accuracy_score(all_labels, all_preds) if all_labels else 0.0
-    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if all_labels else 0.0
+    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division='0') if all_labels else 0.0
     
     return epoch_loss, epoch_acc, epoch_f1
 
@@ -93,7 +93,7 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
             labels = labels.to(device)
 
             amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
+            with torch.cuda.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):  # type: ignore[attr-defined]
                 outputs = model(features, masks)
                 loss = criterion(outputs, labels)
 
@@ -109,7 +109,7 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
 
     avg_loss = running_loss / len(dataloader.dataset)
     acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division='0')
     
     # Compute ROC-AUC based on number of classes
     try:
@@ -252,7 +252,7 @@ def main():
     if args.use_official_mamba:
         print(f"Initializing **OFFICIAL mamba-ssm** Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = OfficialMambaGaitClassifier(
-            input_dim=5,
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff
@@ -260,7 +260,7 @@ def main():
     elif args.use_triton_mamba:
         print(f"Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = HardwareMambaGaitClassifier(
-            input_dim=5,
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff,
@@ -269,7 +269,7 @@ def main():
     elif args.use_gru_baseline:
         print(f"Initializing **BASELINE** GRU+Attention Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = GRUAttentionGaitClassifier(
-            input_dim=5,
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             num_heads=4,
@@ -277,7 +277,7 @@ def main():
         ).to(device)
     else:
         model = MambaGaitClassifier(
-            input_dim=5,  # [GA/e_ant, TA/e_ago, Torque, Stiffness, GaitPhase]
+            input_dim=input_dim,  # Dynamically loaded from FeatureConfig
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff
@@ -307,7 +307,7 @@ def main():
         scaler = None
         use_scaler = False
     else:
-        scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
+        scaler = torch.cuda.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')  # type: ignore[attr-defined]
         use_scaler = True
 
     best_val_f1 = 0.0

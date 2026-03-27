@@ -32,3 +32,10 @@ venv.bak/
 # Plots
 *.png
 *.jpg
+
+# Cache
+cache/
+
+# Logs
+*.log
+out.log
