@@ -74,7 +74,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
     total_samples = len(dataloader.dataset) - nan_batches * dataloader.batch_size
     epoch_loss = running_loss / max(total_samples, 1)
     epoch_acc = accuracy_score(all_labels, all_preds) if all_labels else 0.0
-    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if all_labels else 0.0
+    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0.0) if all_labels else 0.0
     
     return epoch_loss, epoch_acc, epoch_f1
 
@@ -109,7 +109,7 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
 
     avg_loss = running_loss / len(dataloader.dataset)
     acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0.0)
     
     # Compute ROC-AUC based on number of classes
     try:

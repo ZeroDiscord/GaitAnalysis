@@ -23,7 +23,7 @@ except ImportError:
     _GAIT_PHASE_AVAILABLE = False
     def _freq_features(x, fs=1000.0):
         return {'mean_freq': 0.0, 'spectral_entropy': 0.0, 'total_power': 0.0}
-    def _gait_cycle_feats(e_ago, e_ant, fs):
+    def _gait_cycle_feats(ta_signal, ga_signal, fs):
         return {}
 
 class GaitPathologyDataset(Dataset):
@@ -179,7 +179,8 @@ class GaitPathologyDataset(Dataset):
             window_feat = parent[start:end]
             
         # Global Normalization (Applied IDENTICALLY to Val/Test using Training Stats)
-        window_feat = (window_feat - self.global_mean) / (self.global_std + 1e-8)
+        global_std_val = self.global_std if self.global_std is not None else 0.0
+        window_feat = (window_feat - (self.global_mean if self.global_mean is not None else 0.0)) / (global_std_val + 1e-8)
         
         # Hard clamp extreme outliers (prevents nan loss spikes from exploding gradients)
         window_feat = torch.clamp(window_feat, min=-10.0, max=10.0)
@@ -211,7 +212,7 @@ class GaitPathologyDataset(Dataset):
         
         return features
 
-    def _get_cache_path(self, file_path: str) -> str:
+    def _get_cache_path(self, file_path: str) -> Optional[str]:
         """Get cache file path for a given input file."""
         if not self.feature_config.enable_feature_caching:
             return None
@@ -361,7 +362,7 @@ def collate_fn_pad(batch):
     """
     sequences, labels = zip(*batch)
     
-    padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0.0)
+    padded_sequences = pad_sequence(list(sequences), batch_first=True, padding_value=0.0)
     
     attention_masks = torch.zeros(padded_sequences.shape[0], padded_sequences.shape[1], dtype=torch.float32)
     for i, seq in enumerate(sequences):

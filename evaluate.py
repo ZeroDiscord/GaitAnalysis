@@ -132,7 +132,7 @@ def run_evaluation(model, dataloader, device, num_classes, class_names, benchmar
 
     # Compute Final Metrics
     acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0.0)
     
     # Compute ROC-AUC handling binary vs multi-class
     try:
@@ -164,7 +164,7 @@ def run_evaluation(model, dataloader, device, num_classes, class_names, benchmar
         print("ROC-AUC Score:    [N/A]")
     print("\nDetailed Classification Report:")
     # Ignore warnings for undefined metrics if a class was never predicted
-    print(classification_report(all_labels, all_preds, labels=range(num_classes), target_names=class_names, zero_division=0))
+    print(classification_report(all_labels, all_preds, labels=range(num_classes), target_names=class_names, zero_division=0.0))
     print("="*50)
 
     # ── Inference-Time Metrics ─────────────────────────────────────────
@@ -246,7 +246,8 @@ if __name__ == "__main__":
          print("Generating dummy evaluation on training set instead for demonstration.")
          test_loader, _, _, _ = create_dataloaders(args.data_dir, batch_size=args.batch_size, random_seed=1)
          
-    model = load_model(args, num_classes, device)
+    input_dim = train_dataset.get_feature_count()
+    model = load_model(args, input_dim, num_classes, device)
     
     _, _, _, cm = run_evaluation(model, test_loader, device, num_classes, class_names, benchmark=args.benchmark)
     plot_confusion_matrix(cm, class_names, save_path=args.output_plot)
