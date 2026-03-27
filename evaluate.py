@@ -217,20 +217,45 @@ if __name__ == "__main__":
     # Use testing batch size (can be larger up to memory limit since no gradients stored)
     parser.add_argument('--batch_size', type=int, default=4, help='Inference batch size')
     parser.add_argument('--benchmark', action='store_true', help='Print detailed per-batch inference timing breakdown')
+    
+    # Enhanced feature arguments (Must match training!)
+    parser.add_argument('--enhanced_features', action='store_true', help='Use enhanced feature extraction (17+ features)')
+    parser.add_argument('--legacy_mode', action='store_true', help='Force legacy mode (5 features) even with enhanced_features flag')
+    parser.add_argument('--enable_pca', action='store_true', help='Enable PCA dimensionality reduction')
+    parser.add_argument('--pca_components', type=int, default=10, help='Number of PCA components')
+    parser.add_argument('--enable_ica', action='store_true', help='Enable ICA dimensionality reduction')
+    parser.add_argument('--ica_components', type=int, default=8, help='Number of ICA components')
 
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Evaluation Device: {device}")
 
-    # To ensure identical pre-processing, we use the same loader but only take the test_loader
+    # Configure feature extraction to match training
+    if args.enhanced_features and not args.legacy_mode:
+        feature_config = FeatureConfig(
+            legacy_mode=False,
+            include_base_features=True,
+            include_time_domain=True,
+            include_freq_domain=True,
+            include_gait_cycle=True,
+            enable_pca=args.enable_pca,
+            pca_components=args.pca_components,
+            enable_ica=args.enable_ica,
+            ica_components=args.ica_components,
+            enable_feature_caching=True
+        )
+    else:
+        feature_config = None
+
     print(f"Scanning dataset from {args.data_dir} to extract classes...")
     try:
         _, _, test_loader, train_dataset = create_dataloaders(
             args.data_dir, 
             batch_size=args.batch_size,
             window_size=2000,
-            base_stride=1000
+            base_stride=1000,
+            feature_config=feature_config
         )
     except Exception as e:
         print(f"Failed to load dataset: {e}")
