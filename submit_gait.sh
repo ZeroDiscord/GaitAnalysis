@@ -22,7 +22,9 @@ python3 train.py \
     --batch_size 16 \
     --accum_steps 2 \
     --use_triton_mamba \
+    --enhanced_features \
     --output_name "best_mamba_model.pth"
+    
 # 2. Run GRU Baseline Training First
 echo "--- Starting GRU Baseline Training on H100 ---"
 python3 train.py \
@@ -31,4 +33,5 @@ python3 train.py \
     --batch_size 16 \
     --accum_steps 2 \
     --use_gru_baseline \
+    --enhanced_features \
     --output_name "best_gru_baseline.pth"
