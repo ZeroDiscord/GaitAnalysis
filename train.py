@@ -345,4 +345,12 @@ def main():
     print(f"Confusion Matrix:\n{test_cm}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        with open("error_log.txt", "w") as f:
+            f.write("Unhandled Exception during training:\n")
+            traceback.print_exc(file=f)
+        print("An error occurred and was logged to error_log.txt.")
+        raise
