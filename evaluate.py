@@ -14,27 +14,27 @@ from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-def load_model(args, input_dim, num_classes, device):
+def load_model(args, input_dim, static_dim, num_classes, device):
     """Initializes the correct model architecture based on flags."""
     if args.use_official_mamba:
         print("Loading **OFFICIAL mamba-ssm** Classifier...")
         model = OfficialMambaGaitClassifier(
-            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers, static_dim=static_dim
         )
     elif args.use_triton_mamba:
         print("Loading **HARDWARE-ACCELERATED** Triton Mamba Classifier...")
         model = HardwareMambaGaitClassifier(
-            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers, chunk_size=2048
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers, chunk_size=2048, static_dim=static_dim
         )
     elif args.use_gru_baseline:
         print("Loading **BASELINE** GRU+Attention Classifier...")
         model = GRUAttentionGaitClassifier(
-            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, num_heads=4, n_layers=args.n_layers
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, num_heads=4, n_layers=args.n_layers, static_dim=static_dim
         )
     else:
         print("Loading **NATIVE PYTORCH** Mamba Classifier...")
         model = MambaGaitClassifier(
-            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers
+            input_dim=input_dim, num_classes=num_classes, d_model=args.d_model, n_layers=args.n_layers, static_dim=static_dim
         )
         
     # Load weights
@@ -94,9 +94,10 @@ def run_evaluation(model, dataloader, device, num_classes, class_names, benchmar
     wall_start = time.perf_counter()
 
     with torch.no_grad():
-        for features, masks, labels in dataloader:
+        for features, masks, static_features, labels in dataloader:
             features = features.to(device)
             masks = masks.to(device)
+            static_features = static_features.to(device)
             labels = labels.to(device)
             batch_size = features.size(0)
             total_samples += batch_size
@@ -109,10 +110,10 @@ def run_evaluation(model, dataloader, device, num_classes, class_names, benchmar
             # on CPU silently produces NaN/garbage — so we skip AMP entirely on CPU.
             if device.type == 'cuda':
                 amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype):
-                    outputs = model(features, masks)
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                    outputs = model(features, masks, static_features=static_features)
             else:
-                outputs = model(features, masks)
+                outputs = model(features, masks, static_features=static_features)
 
             if device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -272,7 +273,8 @@ if __name__ == "__main__":
          test_loader, _, _, _ = create_dataloaders(args.data_dir, batch_size=args.batch_size, random_seed=1)
          
     input_dim = train_dataset.get_feature_count()
-    model = load_model(args, input_dim, num_classes, device)
+    static_dim = train_dataset.get_static_feature_count()
+    model = load_model(args, input_dim, static_dim, num_classes, device)
     
     _, _, _, cm = run_evaluation(model, test_loader, device, num_classes, class_names, benchmark=args.benchmark)
     plot_confusion_matrix(cm, class_names, save_path=args.output_plot)

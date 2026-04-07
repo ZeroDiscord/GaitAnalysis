@@ -41,8 +41,9 @@ class GaitPathologyDataset(Dataset):
                  feature_config: Optional[FeatureConfig] = None,
                  alpha=1.0, beta=1.0, 
                  window_size=2000, base_stride=1000, mode='train', 
-                 global_mean=None, global_std=None, balance_classes=True,
-                 fs=1000.0):
+                 global_mean=None, global_std=None,
+                 static_global_mean=None, static_global_std=None,
+                 balance_classes=True, fs=1000.0):
         """
         Args:
             file_paths: List of absolute paths to CSV files.
@@ -73,6 +74,8 @@ class GaitPathologyDataset(Dataset):
         
         self.global_mean = global_mean
         self.global_std = global_std
+        self.static_global_mean = static_global_mean
+        self.static_global_std = static_global_std
         
         self.classes = sorted(list(class_to_idx.keys()))
         self.num_classes = len(self.classes)
@@ -81,27 +84,45 @@ class GaitPathologyDataset(Dataset):
         if not self.legacy_mode and self.feature_config.enable_feature_caching:
             os.makedirs(self.feature_config.cache_dir, exist_ok=True)
         
-        # Enhanced feature extraction for base samples
+        # Feature extraction for base samples
+        # In enhanced mode: features = temporal [seq_len, 5], static_features = [n_static]
+        # In legacy mode:   features = temporal [seq_len, 5], static_features = zeros(0)
         self.base_samples = []
         for path, label in zip(file_paths, labels):
             if self.legacy_mode:
                 features = self._extract_legacy_features(path)
+                static_features = torch.zeros(0)
             else:
-                features = self._load_or_compute_features(path, label)
+                features, static_features = self._load_or_compute_features(path, label)
             
             self.base_samples.append({
                 'features': features,
+                'static_features': static_features,
                 'label': label,
                 'length': features.size(0)
             })
 
         # 2. Extract dataset-wide Global Mean/Std from Training Data BEFORE splitting into windows!
+        # Computed separately for temporal features and static features.
         if self.mode == 'train' and (self.global_mean is None or self.global_std is None):
             all_data = torch.cat([s['features'] for s in self.base_samples], dim=0)
             self.global_mean = torch.mean(all_data, dim=0, keepdim=True)
             self.global_std = torch.std(all_data, dim=0, keepdim=True)
-            print(f"Computed Global Train Mean: {self.global_mean.squeeze().tolist()}")
-            print(f"Computed Global Train Std:  {self.global_std.squeeze().tolist()}")
+            print(f"Computed Global Train Mean (temporal): {self.global_mean.squeeze().tolist()}")
+            print(f"Computed Global Train Std  (temporal): {self.global_std.squeeze().tolist()}")
+        
+        # Static feature normalization stats (computed once across all files, not timesteps)
+        if self.mode == 'train' and (self.static_global_mean is None or self.static_global_std is None):
+            static_feats = [s['static_features'] for s in self.base_samples if s['static_features'].numel() > 0]
+            if static_feats:
+                all_static = torch.stack(static_feats, dim=0)  # [n_files, n_static]
+                self.static_global_mean = torch.mean(all_static, dim=0)  # [n_static]
+                self.static_global_std = torch.std(all_static, dim=0)    # [n_static]
+                print(f"Computed Global Train Mean (static): {self.static_global_mean.tolist()}")
+                print(f"Computed Global Train Std  (static): {self.static_global_std.tolist()}")
+            else:
+                self.static_global_mean = None
+                self.static_global_std = None
 
         # 3. Sliding Window Segmentation (With Native Balancing)
         self.windows = []
@@ -124,11 +145,13 @@ class GaitPathologyDataset(Dataset):
             else:
                 active_stride = base_stride
                 
-            # Generate the window pointers
+            # Generate the window pointers (include static features per window)
+            static_feat = sample['static_features']
             start_idx = 0
             while start_idx + self.window_size <= L:
                 self.windows.append({
                     'parent_feat': feat,
+                    'static_features': static_feat,
                     'start': start_idx,
                     'label': lbl
                 })
@@ -138,6 +161,7 @@ class GaitPathologyDataset(Dataset):
             if start_idx == 0:
                  self.windows.append({
                     'parent_feat': feat,
+                    'static_features': static_feat,
                     'start': 0,
                     'label': lbl
                 })
@@ -150,6 +174,7 @@ class GaitPathologyDataset(Dataset):
     def __getitem__(self, idx):
         window = self.windows[idx]
         parent = window['parent_feat']
+        static_feat = window['static_features'].clone()
         start = window['start']
         lbl = window['label']
         
@@ -172,20 +197,23 @@ class GaitPathologyDataset(Dataset):
                 
             window_feat = parent[new_start:new_end]
             
-            # Additional Feature Augmentation: Random Scaling
+            # Additional Feature Augmentation: Random Scaling (temporal only)
             scale_factor = random.uniform(0.9, 1.1)
             window_feat = window_feat * scale_factor
         else:
             window_feat = parent[start:end]
             
-        # Global Normalization (Applied IDENTICALLY to Val/Test using Training Stats)
+        # --- Temporal Feature Normalization ---
         global_std_val = self.global_std if self.global_std is not None else 0.0
         window_feat = (window_feat - (self.global_mean if self.global_mean is not None else 0.0)) / (global_std_val + 1e-8)
-        
-        # Hard clamp extreme outliers (prevents nan loss spikes from exploding gradients)
         window_feat = torch.clamp(window_feat, min=-10.0, max=10.0)
+
+        # --- Static Feature Normalization ---
+        if static_feat.numel() > 0 and self.static_global_mean is not None:
+            static_feat = (static_feat - self.static_global_mean) / (self.static_global_std + 1e-8)
+            static_feat = torch.clamp(static_feat, min=-10.0, max=10.0)
             
-        return window_feat, torch.tensor(lbl, dtype=torch.long)
+        return window_feat, static_feat, torch.tensor(lbl, dtype=torch.long)
 
     def _extract_legacy_features(self, file_path: str) -> torch.Tensor:
         """Extract legacy 5-channel features (original pipeline)."""
@@ -223,33 +251,50 @@ class GaitPathologyDataset(Dataset):
         cache_filename = f"{os.path.basename(file_path)}_{file_hash}_{config_hash}.npz"
         return os.path.join(self.feature_config.cache_dir, cache_filename)
     
-    def _load_or_compute_features(self, file_path: str, label: int) -> torch.Tensor:
-        """Load cached features or compute and cache new ones."""
+    def _load_or_compute_features(self, file_path: str, label: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load cached features or compute and cache new ones.
+        Returns: (temporal_features [seq_len, 5], static_features [n_static])
+        """
         cache_path = self._get_cache_path(file_path)
         
         # Try to load from cache first
         if cache_path and os.path.exists(cache_path):
             try:
                 cached_data = np.load(cache_path)
-                features = torch.tensor(cached_data['features'], dtype=torch.float32)
-                return features
+                # Support both old single-array cache and new split cache
+                if 'temporal' in cached_data and 'static' in cached_data:
+                    temporal = torch.tensor(cached_data['temporal'], dtype=torch.float32)
+                    static = torch.tensor(cached_data['static'], dtype=torch.float32)
+                    return temporal, static
+                else:
+                    # Old cache format — discard and recompute
+                    print(f"Old cache format detected for {file_path}. Recomputing...")
             except Exception as e:
                 print(f"Cache load failed for {file_path}: {e}. Recomputing...")
         
         # Compute features from scratch
-        features = self._extract_enhanced_features(file_path)
+        temporal_features, static_features = self._extract_enhanced_features(file_path)
         
         # Cache the computed features
         if cache_path:
             try:
-                np.savez_compressed(cache_path, features=features.numpy())
+                np.savez_compressed(
+                    cache_path,
+                    temporal=temporal_features.numpy(),
+                    static=static_features.numpy()
+                )
             except Exception as e:
                 print(f"Cache save failed for {file_path}: {e}")
         
-        return features
+        return temporal_features, static_features
     
-    def _extract_enhanced_features(self, file_path: str) -> torch.Tensor:
-        """Extract enhanced features from a single CSV file."""
+    def _extract_enhanced_features(self, file_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract enhanced features from a single CSV file.
+        
+        Returns:
+            temporal_features: [seq_len, 5] tensor of time-varying base features.
+            static_features:   [n_advanced] tensor of whole-sequence statistical scalars.
+        """
         # Load raw EMG data
         df = pd.read_csv(file_path, header=None)
         e_ago = df.iloc[:, 0].values.astype(np.float64)  # TA (Tibialis Anterior)
@@ -260,47 +305,31 @@ class GaitPathologyDataset(Dataset):
         e_ago = np.nan_to_num(e_ago, nan=0.0, posinf=0.0, neginf=0.0)
         
         sequence_length = len(e_ant)
-        all_features = []
         
-        # Base features (if enabled)
+        # --- Temporal Stream: base features that vary per timestep ---
         if self.feature_config.include_base_features:
-            # Physics-informed features
             torque = self.alpha * e_ant - self.beta * e_ago
             stiffness = e_ant + e_ago
-            
-            # Gait phase
             try:
                 gait_phase = assign_gait_phase_continuous(e_ago, e_ant, self.fs)
             except Exception:
                 gait_phase = np.linspace(0.0, 100.0, sequence_length, dtype=np.float32)
-            
-            # Stack base features: [e_ant, e_ago, torque, stiffness, gait_phase]
-            base_features = np.column_stack((e_ant, e_ago, torque, stiffness, gait_phase))
-            all_features.append(base_features)
-        
-        # Advanced features are computed per-window and then broadcast to sequence length
-        advanced_features = self._extract_advanced_features_per_sequence(e_ant, e_ago)
-        
-        if advanced_features.size > 0:
-            # Broadcast advanced features to match sequence length
-            advanced_features_broadcast = np.tile(advanced_features, (sequence_length, 1))
-            all_features.append(advanced_features_broadcast)
-        
-        # Concatenate all features
-        if all_features:
-            features = np.concatenate(all_features, axis=1)
+            temporal_np = np.column_stack((e_ant, e_ago, torque, stiffness, gait_phase))
         else:
-            # Fallback to base features only
-            torque = self.alpha * e_ant - self.beta * e_ago
-            stiffness = e_ant + e_ago
-            gait_phase = np.linspace(0.0, 100.0, sequence_length, dtype=np.float32)
-            features = np.column_stack((e_ant, e_ago, torque, stiffness, gait_phase))
+            # Fallback: raw signals only
+            temporal_np = np.column_stack((e_ant, e_ago))
         
-        # Convert to tensor and clean
-        features = torch.tensor(features, dtype=torch.float32)
-        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        temporal_features = torch.tensor(temporal_np, dtype=torch.float32)
+        temporal_features = torch.nan_to_num(temporal_features, nan=0.0, posinf=0.0, neginf=0.0)
         
-        return features
+        # --- Static Stream: whole-sequence statistical scalars ---
+        # These are NOT broadcast. They are stored as a 1-D vector and routed
+        # directly into the classifier head, bypassing the sequence model entirely.
+        static_np = self._extract_advanced_features_per_sequence(e_ant, e_ago)
+        static_features = torch.tensor(static_np, dtype=torch.float32)
+        static_features = torch.nan_to_num(static_features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return temporal_features, static_features
     
     def _extract_advanced_features_per_sequence(self, e_ant: np.ndarray, e_ago: np.ndarray) -> np.ndarray:
         """Extract advanced features for an entire sequence (to be broadcast per timestep)."""
@@ -349,28 +378,38 @@ class GaitPathologyDataset(Dataset):
         return self.feature_config.get_enabled_features()
     
     def get_feature_count(self) -> int:
-        """Get total number of features per timestep."""
+        """Get number of TEMPORAL features per timestep (used as model input_dim)."""
         if self.legacy_mode:
             return 5
-        return self.feature_config.get_total_feature_count()
+        # Only count the base (temporal) features — static features bypass the sequence model
+        return 5 if self.feature_config.include_base_features else 0
+    
+    def get_static_feature_count(self) -> int:
+        """Get number of STATIC features (used as classifier head auxiliary input)."""
+        if self.legacy_mode or not self.base_samples:
+            return 0
+        return int(self.base_samples[0]['static_features'].shape[0])
 
 def collate_fn_pad(batch):
     """
     Collate function handles variable sequence lengths.
-    Since we use sliding windows, most sequences are perfectly identical in length,
-    but edge cases/short patient files might need padding.
+    Returns a 4-tuple: (padded_sequences, attention_masks, static_features, labels)
+    Static features are per-sample scalars; they do not need sequence padding.
     """
-    sequences, labels = zip(*batch)
+    sequences, static_feats, labels = zip(*batch)
     
     padded_sequences = pad_sequence(list(sequences), batch_first=True, padding_value=0.0)
     
     attention_masks = torch.zeros(padded_sequences.shape[0], padded_sequences.shape[1], dtype=torch.float32)
     for i, seq in enumerate(sequences):
         attention_masks[i, :len(seq)] = 1.0
-        
+    
+    # Stack static features → [batch, n_static]. Works for empty (legacy) tensors too.
+    static_batch = torch.stack(list(static_feats), dim=0)
+    
     labels = torch.stack(labels)
     
-    return padded_sequences, attention_masks, labels
+    return padded_sequences, attention_masks, static_batch, labels
 
 def manual_stratified_split(file_paths, labels, val_split=0.2, test_split=0.1, random_seed=42):
     """
@@ -407,10 +446,12 @@ def manual_stratified_split(file_paths, labels, val_split=0.2, test_split=0.1, r
             test_labels.append(lbl)
             
         elif n == 2:
-            # 2 files: 1 train, 1 test (copy train to val)
+            # 2 files: train on paths[0], validate and test on paths[1].
+            # CRITICAL: val must NEVER be the same file as train to avoid data leakage.
+            # Sharing val and test is imperfect but honest — the model has not seen paths[1].
             train_paths.append(paths[0])
             train_labels.append(lbl)
-            val_paths.append(paths[0])
+            val_paths.append(paths[1])
             val_labels.append(lbl)
             test_paths.append(paths[1])
             test_labels.append(lbl)
@@ -475,22 +516,29 @@ def create_dataloaders(data_dir, batch_size=32, window_size=2000, base_stride=10
         balance_classes=True
     )
     
-    # Extract calculated norm to freeze and pass to val/test
+    # Extract calculated normalization stats to freeze and pass to val/test
+    # Both temporal and static norms are propagated so val/test are normalised identically.
     g_mean = train_dataset.global_mean
     g_std = train_dataset.global_std
+    s_mean = train_dataset.static_global_mean
+    s_std = train_dataset.static_global_std
     
     val_dataset = GaitPathologyDataset(
         val_p, val_l, class_to_idx, 
         feature_config=feature_config,
         window_size=window_size, base_stride=base_stride, mode='val',
-        global_mean=g_mean, global_std=g_std, balance_classes=False
+        global_mean=g_mean, global_std=g_std,
+        static_global_mean=s_mean, static_global_std=s_std,
+        balance_classes=False
     )
     
     test_dataset = GaitPathologyDataset(
         test_p, test_l, class_to_idx, 
         feature_config=feature_config,
         window_size=window_size, base_stride=base_stride, mode='test',
-        global_mean=g_mean, global_std=g_std, balance_classes=False
+        global_mean=g_mean, global_std=g_std,
+        static_global_mean=s_mean, static_global_std=s_std,
+        balance_classes=False
     )
     
     # Assign standard properties expected by train.py/evaluate.py

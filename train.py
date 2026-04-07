@@ -14,7 +14,7 @@ from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1, use_scaler=True):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_steps=1, use_scaler=True):
     model.train()
     running_loss = 0.0
     all_preds = []
@@ -23,15 +23,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
 
     optimizer.zero_grad()
     pbar = tqdm(dataloader, desc="Training", leave=False)
-    for i, (features, masks, labels) in enumerate(pbar):
+    for i, (features, masks, static_features, labels) in enumerate(pbar):
         features = features.to(device)
         masks = masks.to(device)
+        static_features = static_features.to(device)
         labels = labels.to(device)
 
         # Select AMP dtype: bfloat16 on H100 (no scaler needed), float16 elsewhere
         amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-        with torch.cuda.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):  # type: ignore[attr-defined]
-            outputs = model(features, masks)
+        with torch.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
+            outputs = model(features, masks, static_features=static_features)
             loss = criterion(outputs, labels) / accum_steps
         
         # NaN Guard: Skip corrupted batches to prevent permanent model poisoning
@@ -57,7 +58,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
-            scheduler.step()
             optimizer.zero_grad()
 
         running_loss += (loss.item() * accum_steps) * features.size(0)
@@ -87,14 +87,15 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
 
     with torch.no_grad():
         pbar = tqdm(dataloader, desc=desc, leave=False)
-        for features, masks, labels in pbar:
+        for features, masks, static_features, labels in pbar:
             features = features.to(device)
             masks = masks.to(device)
+            static_features = static_features.to(device)
             labels = labels.to(device)
 
             amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.cuda.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):  # type: ignore[attr-defined]
-                outputs = model(features, masks)
+            with torch.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
+                outputs = model(features, masks, static_features=static_features)
                 loss = criterion(outputs, labels)
 
             running_loss += loss.item() * features.size(0)
@@ -152,7 +153,7 @@ def main():
     parser.add_argument('--data_dir', type=str, default='Datasets/', help='Directory containing the dataset')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (keep small, e.g., 2 or 4, for full sequences)')
-    parser.add_argument('--accum_steps', type=int, default=8, help='Gradient accumulation steps to simulate larger batch size')
+    parser.add_argument('--accum_steps', type=int, default=2, help='Gradient accumulation steps to simulate larger batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--d_model', type=int, default=64, help='Model hidden dimension')
     parser.add_argument('--n_layers', type=int, default=2, help='Number of Mamba layers')
@@ -239,7 +240,8 @@ def main():
     
     # Get actual input dimension from dataset
     input_dim = train_dataset.get_feature_count()
-    print(f"Input dimension: {input_dim} features per timestep")
+    static_dim = train_dataset.get_static_feature_count()
+    print(f"Input dimension: {input_dim} features per timestep, plus {static_dim} static features")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -255,7 +257,8 @@ def main():
             input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
-            n_layers=n_layers_eff
+            n_layers=n_layers_eff,
+            static_dim=static_dim
         ).to(device)
     elif args.use_triton_mamba:
         print(f"Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
@@ -264,7 +267,8 @@ def main():
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff,
-            chunk_size=2048
+            chunk_size=2048,
+            static_dim=static_dim
         ).to(device)
     elif args.use_gru_baseline:
         print(f"Initializing **BASELINE** GRU+Attention Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
@@ -273,28 +277,28 @@ def main():
             num_classes=num_classes,
             d_model=d_model_eff,
             num_heads=4,
-            n_layers=n_layers_eff
+            n_layers=n_layers_eff,
+            static_dim=static_dim
         ).to(device)
     else:
         model = MambaGaitClassifier(
             input_dim=input_dim,  # Dynamically loaded from FeatureConfig
             num_classes=num_classes,
             d_model=d_model_eff,
-            n_layers=n_layers_eff
+            n_layers=n_layers_eff,
+            static_dim=static_dim
         ).to(device)
         
     # Standard Cross Entropy Loss. 
     # Class weights removed because Sliding Window dynamically balances the dataset batches!
-    # Added label_smoothing to prevent overconfidence on the small dataset (improves generalization)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Label smoothing removed for honest validation loss interpretation on small datasets
+    criterion = nn.CrossEntropyLoss()
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
-    # Initialize robust Learning Rate Scheduler (OneCycleLR for stable warm-up and cool-down)
-    total_steps = int(args.epochs * np.ceil(len(train_loader) / args.accum_steps))
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=args.lr, total_steps=total_steps,
-        pct_start=0.1, anneal_strategy='cos'
+    # Initialize robust Learning Rate Scheduler (CosineAnnealingLR independent of batch size)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6
     )
     
     # Mixed Precision Setup:
@@ -316,9 +320,12 @@ def main():
     for epoch in range(args.epochs):
         # Train
         train_loss, train_acc, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, scheduler, 
+            model, train_loader, criterion, optimizer, device, scaler, 
             accum_steps=args.accum_steps, use_scaler=use_scaler
         )
+        
+        # Step LR Scheduler strictly per-epoch
+        scheduler.step()
         
         # Validate
         val_loss, val_acc, val_f1, val_auc, _ = evaluate(model, val_loader, criterion, device, num_classes)

@@ -110,7 +110,7 @@ class MambaGaitClassifier(nn.Module):
     """
     Complete Mamba-based architecture for Biomechanics-Informed Gait Pathology Classification.
     """
-    def __init__(self, input_dim=4, num_classes=2, d_model=128, n_layers=4, d_state=16, dropout=0.1):
+    def __init__(self, input_dim=4, num_classes=2, d_model=128, n_layers=4, d_state=16, dropout=0.1, static_dim=0):
         super().__init__()
         self.embedding = nn.Linear(input_dim, d_model)
         
@@ -123,13 +123,13 @@ class MambaGaitClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model + static_dim, d_model // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, num_classes)
         )
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, static_features=None):
         x = self.embedding(x)
         
         for layer in self.layers:
@@ -144,5 +144,8 @@ class MambaGaitClassifier(nn.Module):
              pooled = sum_embeddings / valid_lengths
         else:
             pooled = torch.mean(x, dim=1)
+            
+        if static_features is not None and static_features.size(1) > 0:
+            pooled = torch.cat([pooled, static_features], dim=-1)
             
         return self.classifier(pooled)

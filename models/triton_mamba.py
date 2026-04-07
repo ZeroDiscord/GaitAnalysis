@@ -239,7 +239,7 @@ class HardwareMambaGaitClassifier(nn.Module):
     """
     Replaces the standard Mamba classifier with the Triton/CUDA accelerated version.
     """
-    def __init__(self, input_dim=4, num_classes=2, d_model=128, n_layers=4, d_state=16, chunk_size=2048):
+    def __init__(self, input_dim=4, num_classes=2, d_model=128, n_layers=4, d_state=16, chunk_size=2048, static_dim=0):
         super().__init__()
         self.embedding = nn.Linear(input_dim, d_model)
         self.layers = nn.ModuleList([
@@ -247,9 +247,9 @@ class HardwareMambaGaitClassifier(nn.Module):
             for _ in range(n_layers)
         ])
         self.norm_f = nn.LayerNorm(d_model)
-        self.classifier = nn.Linear(d_model, num_classes)
+        self.classifier = nn.Linear(d_model + static_dim, num_classes)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, static_features=None):
         x = self.embedding(x)
         for layer in self.layers:
             x = x + layer(x, mask=mask)
@@ -262,5 +262,8 @@ class HardwareMambaGaitClassifier(nn.Module):
              pooled = sum_embeddings / valid_lengths
         else:
             pooled = torch.mean(x, dim=1)
+            
+        if static_features is not None and static_features.size(1) > 0:
+            pooled = torch.cat([pooled, static_features], dim=-1)
             
         return self.classifier(pooled)

@@ -7,7 +7,7 @@ class GRUAttentionGaitClassifier(nn.Module):
     Requested Baseline Model: GRU with Masked Multi-Head Attention and Key-Value Caching.
     Useful for benchmarking Mamba's performance and parameter efficiency against classic RNN+Attention architectures.
     """
-    def __init__(self, input_dim=4, num_classes=2, d_model=64, num_heads=4, n_layers=2, dropout=0.1):
+    def __init__(self, input_dim=4, num_classes=2, d_model=64, num_heads=4, n_layers=2, dropout=0.1, static_dim=0):
         super().__init__()
         self.d_model = d_model
         
@@ -35,13 +35,13 @@ class GRUAttentionGaitClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model + static_dim, d_model // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, num_classes)
         )
 
-    def forward(self, x, mask=None, kv_cache=None):
+    def forward(self, x, mask=None, kv_cache=None, static_features=None):
         """
         Forward pass with optional KV caching for streaming generation.
         kv_cache shape: dict containing 'gru_hidden' and 'past_key_values'
@@ -103,6 +103,9 @@ class GRUAttentionGaitClassifier(nn.Module):
              pooled = sum_embeddings / valid_lengths
         else:
             pooled = torch.mean(x_out, dim=1)
+            
+        if static_features is not None and static_features.size(1) > 0:
+            pooled = torch.cat([pooled, static_features], dim=-1)
             
         logits = self.classifier(pooled)
         
