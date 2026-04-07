@@ -1,4 +1,5 @@
 ***Note: Run `train.py` with the `--enhanced_features` flag to use all 22 top features***
+> Warning: Deprecated `README.md`
 ---
 # Biomechanics-Informed Gait Pathology Classification
 
