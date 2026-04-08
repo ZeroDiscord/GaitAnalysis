@@ -1,12 +1,13 @@
 #!/bin/bash
 #PBS -N gaitAnalysis
 #PBS -q gpu
-#PBS -l select=1:ncpus=10:ngpus=1:mem=32g
-#PBS -j oe
+#PBS -l select=1:ncpus=16:ngpus=1:mem=32g
+#PBS -o gait.out
+#PBS -e gait.err
 #PBS -V 
 
 # Navigate explicitly to the folder to bypass PBS_O_WORKDIR quote expansion errors
-cd "/home/aantriksh.124259/Gait Analysis"
+cd "/home/aantriksh.124259/GaitAnalysis-dev"
 
 # Setup environment using Conda
 source /home/soft/anaconda3/etc/profile.d/conda.sh
@@ -18,17 +19,28 @@ module load cuda
 echo "--- Starting Mamba Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
-    --epochs 100 \
+    --epochs 150 \
     --batch_size 16 \
     --accum_steps 2 \
+    --lr 5e-4 \
+    --dropout 0.4 \
+    --weight_decay 0.05 \
+    --patience 15 \
     --use_triton_mamba \
+    --enhanced_features \
     --output_name "best_mamba_model.pth"
-# 2. Run GRU Baseline Training First
+
+# 2. Run GRU Baseline Training
 echo "--- Starting GRU Baseline Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
-    --epochs 100 \
+    --epochs 150 \
     --batch_size 16 \
     --accum_steps 2 \
+    --lr 5e-4 \
+    --dropout 0.4 \
+    --weight_decay 0.05 \
+    --patience 15 \
     --use_gru_baseline \
+    --enhanced_features \
     --output_name "best_gru_baseline.pth"
