@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+<<<<<<< HEAD
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
@@ -7,6 +8,8 @@ __pycache__/
 submit_gait.sh
 *.o*
 *.e*
+=======
+>>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
 *.py[cod]
 *$py.class
 
