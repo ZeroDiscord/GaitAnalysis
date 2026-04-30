@@ -81,7 +81,9 @@ def plot_scatter(df, x_col, y_col, classes, output_dir):
 
 def plot_correlation_heatmap(df, output_dir):
     feat_cols = _get_feature_columns(df)
-    corr = df[feat_cols].corr()
+    # Aggregate to patient-level to avoid within-subject autocorrelation
+    patient_df = df.groupby(['patient_id', 'class_name']).mean(numeric_only=True).reset_index()
+    corr = patient_df[feat_cols].corr()
 
     g = sns.clustermap(corr, cmap='coolwarm', center=0,
                        linewidths=0.5, figsize=(max(12, len(feat_cols) * 0.45),
@@ -98,29 +100,31 @@ def plot_correlation_heatmap(df, output_dir):
 
 def plot_pca(df, classes, output_dir):
     feat_cols = _get_feature_columns(df)
-    X = df[feat_cols].values
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    X = StandardScaler().fit_transform(X)
+    # Aggregate to patient-level to prevent within-subject autocorrelation
+    patient_df = df.groupby(['patient_id', 'class_name']).mean(numeric_only=True).reset_index()
+    X_patient = patient_df[feat_cols].values
+    X_patient = np.nan_to_num(X_patient, nan=0.0, posinf=0.0, neginf=0.0)
+    X_patient = StandardScaler().fit_transform(X_patient)
 
     pca = PCA(n_components=2)
-    components = pca.fit_transform(X)
+    components = pca.fit_transform(X_patient)
 
     palette = _class_palette(classes)
     fig, ax = plt.subplots(figsize=(8, 6))
     for cls in classes:
-        mask = df['class_name'].values == cls
+        mask = patient_df['class_name'].values == cls
         ax.scatter(components[mask, 0], components[mask, 1],
-                   label=cls, alpha=0.6, s=30, color=palette[cls], edgecolors='w', linewidths=0.3)
+                   label=cls, alpha=0.8, s=60, color=palette[cls], edgecolors='k', linewidths=0.5)
     ev = pca.explained_variance_ratio_
     ax.set_xlabel(f'PC1 ({ev[0] * 100:.1f}% var)', fontsize=12)
     ax.set_ylabel(f'PC2 ({ev[1] * 100:.1f}% var)', fontsize=12)
-    ax.set_title('PCA Projection (PC1 vs PC2)', fontsize=14)
+    ax.set_title('PCA Projection — Patient-Level (PC1 vs PC2)', fontsize=13)
     ax.legend(title='Class', fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, 'pca_projection.png'), dpi=150)
     plt.close(fig)
-    print('  ✓ Saved pca_projection.png')
+    print('  ✓ Saved pca_projection.png (patient-level)')
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +133,10 @@ def plot_pca(df, classes, output_dir):
 
 def plot_lda(df, classes, output_dir):
     feat_cols = _get_feature_columns(df)
-    X = df[feat_cols].values
-    y = df['label'].values
+    # Aggregate to patient-level
+    patient_df = df.groupby(['patient_id', 'class_name', 'label']).mean(numeric_only=True).reset_index()
+    X = patient_df[feat_cols].values
+    y = patient_df['label'].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     X = StandardScaler().fit_transform(X)
 
@@ -148,20 +154,20 @@ def plot_lda(df, classes, output_dir):
     if n_components == 1:
         # Only 1 LD axis available (2-class problem) — plot as 1-D strip
         for cls in classes:
-            mask = df['class_name'].values == cls
+            mask = patient_df['class_name'].values == cls
             ax.scatter(components[mask, 0], np.zeros_like(components[mask, 0]),
-                       label=cls, alpha=0.6, s=30, color=palette[cls], edgecolors='w', linewidths=0.3)
+                       label=cls, alpha=0.8, s=60, color=palette[cls], edgecolors='k', linewidths=0.5)
         ax.set_xlabel('LD1', fontsize=12)
         ax.set_yticks([])
         ax.set_title('LDA Projection (LD1)', fontsize=14)
     else:
         for cls in classes:
-            mask = df['class_name'].values == cls
+            mask = patient_df['class_name'].values == cls
             ax.scatter(components[mask, 0], components[mask, 1],
-                       label=cls, alpha=0.6, s=30, color=palette[cls], edgecolors='w', linewidths=0.3)
+                       label=cls, alpha=0.8, s=60, color=palette[cls], edgecolors='k', linewidths=0.5)
         ax.set_xlabel('LD1', fontsize=12)
         ax.set_ylabel('LD2', fontsize=12)
-        ax.set_title('LDA Projection (LD1 vs LD2)', fontsize=14)
+        ax.set_title('LDA Projection — Patient-Level (LD1 vs LD2)', fontsize=13)
 
     ax.legend(title='Class', fontsize=10)
     ax.grid(True, alpha=0.3)
@@ -177,7 +183,9 @@ def plot_lda(df, classes, output_dir):
 
 def plot_ica(df, classes, output_dir, n_components=2):
     feat_cols = _get_feature_columns(df)
-    X = df[feat_cols].values
+    # Aggregate to patient-level
+    patient_df = df.groupby(['patient_id', 'class_name']).mean(numeric_only=True).reset_index()
+    X = patient_df[feat_cols].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     X = StandardScaler().fit_transform(X)
 
@@ -191,12 +199,12 @@ def plot_ica(df, classes, output_dir, n_components=2):
     palette = _class_palette(classes)
     fig, ax = plt.subplots(figsize=(8, 6))
     for cls in classes:
-        mask = df['class_name'].values == cls
+        mask = patient_df['class_name'].values == cls
         ax.scatter(components[mask, 0], components[mask, 1],
-                   label=cls, alpha=0.6, s=30, color=palette[cls], edgecolors='w', linewidths=0.3)
+                   label=cls, alpha=0.8, s=60, color=palette[cls], edgecolors='k', linewidths=0.5)
     ax.set_xlabel('IC1', fontsize=12)
     ax.set_ylabel('IC2', fontsize=12)
-    ax.set_title('ICA Projection (IC1 vs IC2)', fontsize=14)
+    ax.set_title('ICA Projection — Patient-Level (IC1 vs IC2)', fontsize=13)
     ax.legend(title='Class', fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -308,7 +316,7 @@ def _find_interesting_clip(signal, clip_len=1000):
 
 
 def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
-                          clip_len=1000, rms_window=50):
+                          clip_len=1000, rms_window=50, feature_df=None):
     """
     For each class, pick one representative patient, auto-select an
     interesting ~clip_len segment, and plot:
@@ -327,7 +335,22 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
         file_list = classes_with_paths[cls_name]
         if not file_list:
             continue
-        csv_path, patient_id = file_list[0]
+        # Pick median-representative patient instead of always first alphabetically
+        csv_path, patient_id = file_list[0]  # fallback
+        if feature_df is not None:
+            from scipy.spatial.distance import cdist
+            _fc = _get_feature_columns(feature_df)
+            _cls_sub = feature_df[feature_df['class_name'] == cls_name]
+            if not _cls_sub.empty and _fc:
+                _centroid = _cls_sub[_fc].mean(numeric_only=True).values.reshape(1, -1)
+                _centroid = np.nan_to_num(_centroid, nan=0.0)
+                _pmeans = _cls_sub.groupby('patient_id')[_fc].mean()
+                _dists = cdist(_centroid, np.nan_to_num(_pmeans.values, nan=0.0))[0]
+                _best_pid = _pmeans.index[np.argmin(_dists)]
+                for _cp, _pi in file_list:
+                    if _pi == _best_pid:
+                        csv_path, patient_id = _cp, _pi
+                        break
 
         df_raw = pd.read_csv(csv_path, header=None)
         e_ago_full = np.nan_to_num(df_raw.iloc[:, 0].values.astype(float))
@@ -711,7 +734,7 @@ def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1
         classes_with_paths = {}
         for csv_path, cls_name, patient_id in records:
             classes_with_paths.setdefault(cls_name, []).append((csv_path, patient_id))
-        plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir)
+        plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir, feature_df=df)
         plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir)
     else:
         print('  (Skipping waveform/gait-phase plots — no data_dir provided)')

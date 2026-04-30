@@ -570,16 +570,18 @@ def extract_gait_cycle_features(ta_signal: np.ndarray,
 
     cycle_starts, method = detect_gait_cycles(ta_env, ga_env, fs)
 
-    # --- Neutral fallback ---
+    # --- Neutral fallback: use NaN to indicate extraction failure ---
+    # Previous code used hardcoded "healthy gait" values which injected
+    # false signal into downstream analyses (especially EDA feature tables).
     neutral = {
-        'TA_onset_percent': 0.0,     'TA_peak_percent': 15.0,  'TA_offset_percent': 60.0,
-        'GA_onset_percent': 40.0,    'GA_peak_percent': 65.0,  'GA_offset_percent': 75.0,
-        'TA_activation_duration': 60.0, 'GA_activation_duration': 35.0,
-        'coactivation_ratio': 0.1,   'GA_to_TA_ratio': 0.6,
-        'stance_duration': 62.0,     'swing_duration': 38.0,
-        'propulsion_phase_duration': 13.0,
-        'initial_contact_estimate': 0.0, 'midstance_estimate': 31.0,
-        'terminal_stance_estimate': 56.0, 'swing_phase_duration': 38.0,
+        'TA_onset_percent': float('nan'),     'TA_peak_percent': float('nan'),  'TA_offset_percent': float('nan'),
+        'GA_onset_percent': float('nan'),    'GA_peak_percent': float('nan'),  'GA_offset_percent': float('nan'),
+        'TA_activation_duration': float('nan'), 'GA_activation_duration': float('nan'),
+        'coactivation_ratio': float('nan'),   'GA_to_TA_ratio': float('nan'),
+        'stance_duration': float('nan'),     'swing_duration': float('nan'),
+        'propulsion_phase_duration': float('nan'),
+        'initial_contact_estimate': float('nan'), 'midstance_estimate': float('nan'),
+        'terminal_stance_estimate': float('nan'), 'swing_phase_duration': float('nan'),
         'cycle_count': 0,
         'method': method,
     }

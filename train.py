@@ -252,7 +252,7 @@ def main():
     if args.use_official_mamba:
         print(f"Initializing **OFFICIAL mamba-ssm** Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = OfficialMambaGaitClassifier(
-            input_dim=5,
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff
@@ -260,7 +260,7 @@ def main():
     elif args.use_triton_mamba:
         print(f"Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = HardwareMambaGaitClassifier(
-            input_dim=5,
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff,
@@ -269,7 +269,7 @@ def main():
     elif args.use_gru_baseline:
         print(f"Initializing **BASELINE** GRU+Attention Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
         model = GRUAttentionGaitClassifier(
-            input_dim=5,
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             num_heads=4,
@@ -277,7 +277,7 @@ def main():
         ).to(device)
     else:
         model = MambaGaitClassifier(
-            input_dim=5,  # [GA/e_ant, TA/e_ago, Torque, Stiffness, GaitPhase]
+            input_dim=input_dim,  # [GA/e_ant, TA/e_ago, Torque, Stiffness, GaitPhase]
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff

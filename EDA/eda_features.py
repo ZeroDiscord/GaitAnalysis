@@ -182,13 +182,15 @@ def _extract_window_features(e_ant_win, e_ago_win, alpha, beta, fs=1000.0):
     if _GAIT_PHASE_AVAILABLE:
         try:
             phase_feats = _gait_cycle_feats(e_ago_win, e_ant_win, fs)
+            cycle_count = phase_feats.get('cycle_count', 0)
+            row['gp_extraction_failed'] = 0 if cycle_count > 0 else 1
             # Flatten: prefix with 'gp_', skip non-numeric fields
             for k, v in phase_feats.items():
                 if k == 'method':
                     continue
                 row[f'gp_{k}'] = float(v)
         except Exception:
-            pass  # Silently skip if window too short for gait phase
+            row['gp_extraction_failed'] = 1  # Mark as failed
 
     return row
 

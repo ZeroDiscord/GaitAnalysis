@@ -246,7 +246,9 @@ if __name__ == "__main__":
          print("Generating dummy evaluation on training set instead for demonstration.")
          test_loader, _, _, _ = create_dataloaders(args.data_dir, batch_size=args.batch_size, random_seed=1)
          
-    model = load_model(args, num_classes, device)
+    input_dim = train_dataset.get_feature_count()
+    print(f"Input dimension: {input_dim} features per timestep")
+    model = load_model(args, input_dim, num_classes, device)
     
     _, _, _, cm = run_evaluation(model, test_loader, device, num_classes, class_names, benchmark=args.benchmark)
     plot_confusion_matrix(cm, class_names, save_path=args.output_plot)
