@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
-<<<<<<< HEAD
 import torch.nn.functional as F
-=======
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
 
 class GRUAttentionGaitClassifier(nn.Module):
     """
@@ -26,21 +23,11 @@ class GRUAttentionGaitClassifier(nn.Module):
             dropout=dropout if n_layers > 1 else 0.0
         )
         
-<<<<<<< HEAD
         # 3. Masked Multi-Head Attention (Custom SDPA for Extreme Sequences)
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.o_proj = nn.Linear(d_model, d_model)
-=======
-        # 3. Masked Multi-Head Attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
         
         # 4. Layernorms and Pooling
         self.norm1 = nn.LayerNorm(d_model)
@@ -71,7 +58,6 @@ class GRUAttentionGaitClassifier(nn.Module):
         # Residual connection and norm
         gru_out = self.norm1(x + self.dropout(gru_out))
         
-<<<<<<< HEAD
         # 2. Masked Attention Processing (Direct SDPA integration)
         # CRITICAL FIX: Directly use F.scaled_dot_product_attention to bypass nn.MultiheadAttention's
         # tendency to block is_causal=True without an explicit mask.
@@ -105,29 +91,6 @@ class GRUAttentionGaitClassifier(nn.Module):
         # Reshape back to (batch_size, seq_len, d_model)
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.d_model)
         attn_out = self.o_proj(attn_out)
-=======
-        # 2. Masked Attention Processing
-        # Create causal mask ensuring position i can only attend to positions <= i
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
-        
-        # Handle KV Caching
-        if kv_cache is not None and 'past_keys' in kv_cache:
-            past_keys, past_values = kv_cache['past_keys'], kv_cache['past_values']
-            
-        # Attention Forward
-        # key_padding_mask requires True for padded regions
-        key_padding_mask = (mask == 0) if mask is not None else None
-        
-        attn_out, _ = self.attention(
-            query=gru_out,
-            key=gru_out,
-            value=gru_out,
-            attn_mask=causal_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-            is_causal=True
-        )
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
         
         # Residual connection and norm
         x_out = self.norm2(gru_out + self.dropout(attn_out))

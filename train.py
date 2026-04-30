@@ -6,31 +6,20 @@ from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_
 import argparse
 from tqdm import tqdm
 import numpy as np
-<<<<<<< HEAD
 import pandas as pd
 from dataset import create_dataloaders
 from feature_config import FeatureConfig
-=======
-from dataset import create_dataloaders
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
 from models.native_mamba import MambaGaitClassifier
 from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-<<<<<<< HEAD
 def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1, use_scaler=True):
-=======
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_steps=1):
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
-<<<<<<< HEAD
     nan_batches = 0
-=======
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
 
     optimizer.zero_grad()
     pbar = tqdm(dataloader, desc="Training", leave=False)
@@ -39,7 +28,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_s
         masks = masks.to(device)
         labels = labels.to(device)
 
-<<<<<<< HEAD
         # Select AMP dtype: bfloat16 on H100 (no scaler needed), float16 elsewhere
         amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
         with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
@@ -70,24 +58,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_s
                 optimizer.step()
             
             scheduler.step()
-=======
-        # Forward pass with Automatic Mixed Precision
-        with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu'):
-            outputs = model(features, masks)
-            loss = criterion(outputs, labels) / accum_steps
-        
-        # Backward and optimize with Scaler
-        scaler.scale(loss).backward()
-        
-        # Unscale and step if we've reached the accumulation boundary
-        if (i + 1) % accum_steps == 0 or (i + 1) == len(dataloader):
-            # Gradient clipping for stability in sequence models
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
             optimizer.zero_grad()
 
         running_loss += (loss.item() * accum_steps) * features.size(0)
@@ -98,7 +68,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_s
         
         pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-<<<<<<< HEAD
     if nan_batches > 0:
         print(f"  WARNING: {nan_batches} batches had NaN/Inf loss and were skipped.")
         
@@ -106,11 +75,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, accum_s
     epoch_loss = running_loss / max(total_samples, 1)
     epoch_acc = accuracy_score(all_labels, all_preds) if all_labels else 0.0
     epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if all_labels else 0.0
-=======
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
     
     return epoch_loss, epoch_acc, epoch_f1
 
@@ -128,12 +92,8 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
             masks = masks.to(device)
             labels = labels.to(device)
 
-<<<<<<< HEAD
             amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
             with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
-=======
-            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu'):
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
                 outputs = model(features, masks)
                 loss = criterion(outputs, labels)
 
@@ -142,12 +102,8 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
             probs = torch.nn.functional.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
             
-<<<<<<< HEAD
             # Convert bfloat16 explicitly to float32 before passing to numpy
             all_probs.extend(probs.float().cpu().numpy())
-=======
-            all_probs.extend(probs.cpu().numpy())
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -161,7 +117,6 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
         if num_classes == 2:
             auc = roc_auc_score(all_labels, all_probs_np[:, 1])
         else:
-<<<<<<< HEAD
             # Multi-class One-vs-Rest AUC explicitly requires the 'labels' parameter
             # to prevent crashing if a class is entirely missing in a mini-test-set.
             # We strictly enforce float64 precision and safe softmax accumulation here.
@@ -187,12 +142,6 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
                 )
     except Exception as e:
         auc = 0.0
-=======
-            # Multi-class One-vs-Rest AUC
-            auc = roc_auc_score(all_labels, all_probs_np, multi_class='ovr')
-    except Exception as e:
-        auc = 0.0 # Can happen if a class is entirely missing in a mini-test-set
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
         
     cm = confusion_matrix(all_labels, all_preds)
 
@@ -211,7 +160,6 @@ def main():
     parser.add_argument('--use_official_mamba', action='store_true', help='Use the official mamba-ssm package (requires causal-conv1d and mamba-ssm to be pip installed)')
     parser.add_argument('--use_gru_baseline', action='store_true', help='Use the GRU+Attention baseline model instead of Mamba for comparison')
     parser.add_argument('--output_name', type=str, default='best_model.pth', help='Filename to save the best model weights (e.g., mamba_best.pth)')
-<<<<<<< HEAD
     
     # Enhanced feature arguments
     parser.add_argument('--enhanced_features', action='store_true', help='Use enhanced feature extraction (17+ features)')
@@ -245,10 +193,6 @@ def main():
         feature_config = None
         print("Using Legacy Feature Mode (5 features)")
 
-=======
-    args = parser.parse_args()
-
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
     # Create dummy data if folder doesn't exist or is empty just for testing pipeline setup
     has_data = False
     if os.path.exists(args.data_dir):
@@ -260,13 +204,8 @@ def main():
                 
     if not has_data:
         print(f"Creating dummy dataset at {args.data_dir} for testing...")
-<<<<<<< HEAD
         os.makedirs(os.path.join(args.data_dir, "01_Normal"), exist_ok=True)
         os.makedirs(os.path.join(args.data_dir, "02_Pathological"), exist_ok=True)
-=======
-        os.makedirs(os.path.join(args.data_dir, "Normal"), exist_ok=True)
-        os.makedirs(os.path.join(args.data_dir, "Pathological"), exist_ok=True)
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
         
         # Generate some random dummy CSVs (representing E_ant and E_ago time series)
         for i in range(20):
@@ -276,18 +215,13 @@ def main():
                 'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len),
                 'E_ago': np.cos(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len)
             })
-<<<<<<< HEAD
             df_norm.to_csv(os.path.join(args.data_dir, "01_Normal", f"sample_{i}.csv"), index=False, header=False)
-=======
-            df_norm.to_csv(os.path.join(args.data_dir, "Normal", f"sample_{i}.csv"), index=False)
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
             
             df_patho = pd.DataFrame({
                 # Pathological: Co-contraction (high overlap)
                 'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len),
                 'E_ago': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len)
             })
-<<<<<<< HEAD
             df_patho.to_csv(os.path.join(args.data_dir, "02_Pathological", f"sample_{i}.csv"), index=False, header=False)
 
     print("Initializing Data Loaders with Sliding Window...")
@@ -307,23 +241,10 @@ def main():
     input_dim = train_dataset.get_feature_count()
     print(f"Input dimension: {input_dim} features per timestep")
     
-=======
-            df_patho.to_csv(os.path.join(args.data_dir, "Pathological", f"sample_{i}.csv"), index=False)
-
-    print("Initializing Data Loaders...")
-    train_loader, val_loader, test_loader, dataset = create_dataloaders(
-        args.data_dir, batch_size=args.batch_size
-    )
-    classes = dataset.classes
-    num_classes = len(classes)
-    print(f"Detected {num_classes} classes: {classes}")
-    
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Model Initialization
-<<<<<<< HEAD
     # Defaulting to smaller parameter footprint for 5-sample dataset robustness 
     d_model_eff = args.d_model if args.d_model <= 32 else 32
     n_layers_eff = args.n_layers if args.n_layers <= 2 else 2
@@ -388,50 +309,6 @@ def main():
     else:
         scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
         use_scaler = True
-=======
-    if args.use_official_mamba:
-        print("Initializing **OFFICIAL mamba-ssm** Classifier")
-        model = OfficialMambaGaitClassifier(
-            input_dim=4,
-            num_classes=num_classes,
-            d_model=args.d_model,
-            n_layers=args.n_layers
-        ).to(device)
-    elif args.use_triton_mamba:
-        print("Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier")
-        model = HardwareMambaGaitClassifier(
-            input_dim=4,
-            num_classes=num_classes,
-            d_model=args.d_model,
-            n_layers=args.n_layers,
-            chunk_size=2048
-        ).to(device)
-    elif args.use_gru_baseline:
-        print("Initializing **BASELINE** GRU+Attention Classifier")
-        model = GRUAttentionGaitClassifier(
-            input_dim=4,
-            num_classes=num_classes,
-            d_model=args.d_model,
-            num_heads=4,
-            n_layers=args.n_layers
-        ).to(device)
-    else:
-        model = MambaGaitClassifier(
-            input_dim=4, # [E_ant, E_ago, Torque, Stiffness]
-            num_classes=num_classes,
-            d_model=args.d_model,
-            n_layers=args.n_layers
-        ).to(device)
-    
-    # Calculate class weights for imbalanced datasets
-    class_weights = dataset.get_class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    
-    # Initialize Mixed Precision Scaler
-    scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
 
     best_val_f1 = 0.0
 
@@ -439,12 +316,8 @@ def main():
     for epoch in range(args.epochs):
         # Train
         train_loss, train_acc, train_f1 = train_epoch(
-<<<<<<< HEAD
             model, train_loader, criterion, optimizer, device, scaler, scheduler, 
             accum_steps=args.accum_steps, use_scaler=use_scaler
-=======
-            model, train_loader, criterion, optimizer, device, scaler, accum_steps=args.accum_steps
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
         )
         
         # Validate

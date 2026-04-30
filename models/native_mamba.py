@@ -43,14 +43,11 @@ class SimplifiedMambaBlock(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, x, mask=None):
-<<<<<<< HEAD
         # CRITICAL: Force float32 for the entire Mamba recurrence to prevent
         # catastrophic floating-point drift over 2000 sequential timesteps in bfloat16.
         original_dtype = x.dtype
         x = x.float()
         
-=======
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
         batch, seq_len, _ = x.shape
         
         x_proj = self.in_proj(x)
@@ -65,7 +62,6 @@ class SimplifiedMambaBlock(nn.Module):
         x_params = self.x_proj(x_act)
         delta, B, C = torch.split(x_params, [self.d_inner, self.d_state, self.d_state], dim=-1)
         
-<<<<<<< HEAD
         # Clamp delta projections before softplus/exp to prevent infinity
         delta_proj = self.dt_proj(delta)
         delta_proj = torch.clamp(delta_proj, min=-20.0, max=5.0)
@@ -81,18 +77,6 @@ class SimplifiedMambaBlock(nn.Module):
         for t in range(seq_len):
             if mask is not None:
                 step_mask = mask[:, t].unsqueeze(-1).unsqueeze(-1).float()
-=======
-        delta = nn.functional.softplus(self.dt_proj(delta))
-        
-        A = -torch.exp(self.A_log.float()) 
-        
-        y = torch.zeros((batch, seq_len, self.d_inner), device=x.device, dtype=x.dtype)
-        state = torch.zeros((batch, self.d_inner, self.d_state), device=x.device, dtype=x.dtype)
-        
-        for t in range(seq_len):
-            if mask is not None:
-                step_mask = mask[:, t].unsqueeze(-1).unsqueeze(-1) 
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
             else:
                 step_mask = 1.0
 
@@ -107,13 +91,10 @@ class SimplifiedMambaBlock(nn.Module):
             new_state = A_bar * state + B_bar
             state = state * (1 - step_mask) + new_state * step_mask
             
-<<<<<<< HEAD
             # Periodic state clamping to catch runaway accumulation
             if t % 100 == 99:
                 state = torch.clamp(state, min=-1e4, max=1e4)
             
-=======
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
             C_t = C[:, t, :].unsqueeze(-1)
             y_t = torch.matmul(state, C_t).squeeze(-1) 
             y_t = y_t + self.D * x_act[:, t, :]
@@ -122,11 +103,7 @@ class SimplifiedMambaBlock(nn.Module):
             
         y = y * self.activation(res)
         out = self.out_proj(y)
-<<<<<<< HEAD
         return out.to(original_dtype)
-=======
-        return out
->>>>>>> 251ecc3 (Initial commit of GaitMamba Pipeline)
 
 
 class MambaGaitClassifier(nn.Module):
