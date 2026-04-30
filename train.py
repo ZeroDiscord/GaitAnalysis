@@ -1,8 +1,9 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 import argparse
 from tqdm import tqdm
 import numpy as np
@@ -13,6 +14,41 @@ from models.native_mamba import MambaGaitClassifier
 from models.official_mamba import OfficialMambaGaitClassifier
 from models.triton_mamba import HardwareMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
+
+
+# ---------------------------------------------------------------------------
+# Focal Loss — drop-in replacement for nn.CrossEntropyLoss
+# Focuses gradient on hard-to-classify samples (PIVD_Priformis vs PIVD_RA).
+# gamma=2.0 means a 95%-confident correct prediction gets 400x less gradient
+# than a 50%-confused one, forcing the model to work on the hard boundary.
+# ---------------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.02):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        num_classes = logits.size(1)
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                smooth = torch.full_like(logits, self.label_smoothing / (num_classes - 1))
+                smooth.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            focal_w = (1 - probs) ** self.gamma
+            loss = -focal_w * smooth * log_probs
+            if self.weight is not None:
+                loss = loss * self.weight.unsqueeze(0)
+            return loss.sum(dim=1).mean()
+        else:
+            p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            focal_w = (1 - p_t) ** self.gamma
+            ce = F.cross_entropy(logits, targets, weight=self.weight, reduction='none')
+            return (focal_w * ce).mean()
+
 
 def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1, use_scaler=True):
     model.train()
@@ -117,35 +153,24 @@ def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating
         if num_classes == 2:
             auc = roc_auc_score(all_labels, all_probs_np[:, 1])
         else:
-            # Multi-class One-vs-Rest AUC explicitly requires the 'labels' parameter
-            # to prevent crashing if a class is entirely missing in a mini-test-set.
-            # We strictly enforce float64 precision and safe softmax accumulation here.
-            # If a class is completely structurally missing from the *ground truth* of the split,
-            # roc_auc_score will fail. We use a safe wrapper.
             valid_classes = np.unique(all_labels)
             if len(valid_classes) < 2:
-                auc = 0.0 # Mathematically impossible to compute AUC with 1 ground truth class
+                auc = 0.0
             else:
-                # Calculate AUC only on the classes that actually exist in the ground truth
-                # to prevent shape mismatch errors.
                 filtered_probs = all_probs_np[:, valid_classes]
-                # Re-normalize probabilities for the valid classes to sum to 1
                 row_sums = filtered_probs.sum(axis=1, keepdims=True)
                 row_sums[row_sums == 0] = 1e-9
                 filtered_probs = filtered_probs / row_sums
-                
                 auc = roc_auc_score(
-                    all_labels, 
-                    filtered_probs, 
-                    multi_class='ovr', 
-                    labels=valid_classes
+                    all_labels, filtered_probs, 
+                    multi_class='ovr', labels=valid_classes
                 )
     except Exception as e:
         auc = 0.0
         
     cm = confusion_matrix(all_labels, all_preds)
 
-    return avg_loss, acc, f1, auc, cm
+    return avg_loss, acc, f1, auc, cm, all_labels, all_preds
 
 def main():
     parser = argparse.ArgumentParser(description='Train Mamba Gait Classifier')
@@ -160,6 +185,7 @@ def main():
     parser.add_argument('--use_official_mamba', action='store_true', help='Use the official mamba-ssm package (requires causal-conv1d and mamba-ssm to be pip installed)')
     parser.add_argument('--use_gru_baseline', action='store_true', help='Use the GRU+Attention baseline model instead of Mamba for comparison')
     parser.add_argument('--output_name', type=str, default='best_model.pth', help='Filename to save the best model weights (e.g., mamba_best.pth)')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal loss gamma (0 = standard CE, 2 = strong focus on hard examples)')
     
     # Enhanced feature arguments
     parser.add_argument('--enhanced_features', action='store_true', help='Use enhanced feature extraction (17+ features)')
@@ -196,7 +222,6 @@ def main():
     # Create dummy data if folder doesn't exist or is empty just for testing pipeline setup
     has_data = False
     if os.path.exists(args.data_dir):
-        # Check if there are any CSV files in subdirectories
         for root, dirs, files in os.walk(args.data_dir):
             if any(f.endswith('.csv') for f in files):
                 has_data = True
@@ -207,30 +232,26 @@ def main():
         os.makedirs(os.path.join(args.data_dir, "01_Normal"), exist_ok=True)
         os.makedirs(os.path.join(args.data_dir, "02_Pathological"), exist_ok=True)
         
-        # Generate some random dummy CSVs (representing E_ant and E_ago time series)
         for i in range(20):
             seq_len = np.random.randint(50, 150)
             df_norm = pd.DataFrame({
-                # Normal: High distinct separated peaks (made up)
                 'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len),
                 'E_ago': np.cos(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len)
             })
             df_norm.to_csv(os.path.join(args.data_dir, "01_Normal", f"sample_{i}.csv"), index=False, header=False)
             
             df_patho = pd.DataFrame({
-                # Pathological: Co-contraction (high overlap)
                 'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len),
                 'E_ago': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len)
             })
             df_patho.to_csv(os.path.join(args.data_dir, "02_Pathological", f"sample_{i}.csv"), index=False, header=False)
 
     print("Initializing Data Loaders with Sliding Window...")
-    # Smaller batch size default because Mamba has state memory, but each sample is now shorter
     train_loader, val_loader, test_loader, train_dataset = create_dataloaders(
         args.data_dir, 
         batch_size=args.batch_size,
-        window_size=2000,   # Slicing the 26000 sequence into 2000 frame chunks
-        base_stride=1000,   # Generate a new slice every 1000 frames
+        window_size=2000,
+        base_stride=1000,
         feature_config=feature_config
     )
     classes = train_dataset.classes
@@ -245,7 +266,7 @@ def main():
     print(f"Using device: {device}")
 
     # Model Initialization
-    # Defaulting to smaller parameter footprint for 5-sample dataset robustness 
+    # Cap d_model and n_layers for 38-patient dataset robustness
     d_model_eff = args.d_model if args.d_model <= 32 else 32
     n_layers_eff = args.n_layers if args.n_layers <= 2 else 2
     
@@ -277,16 +298,28 @@ def main():
         ).to(device)
     else:
         model = MambaGaitClassifier(
-            input_dim=input_dim,  # [GA/e_ant, TA/e_ago, Torque, Stiffness, GaitPhase]
+            input_dim=input_dim,
             num_classes=num_classes,
             d_model=d_model_eff,
             n_layers=n_layers_eff
         ).to(device)
         
-    # Standard Cross Entropy Loss. 
-    # Class weights removed because Sliding Window dynamically balances the dataset batches!
-    # Added label_smoothing to prevent overconfidence on the small dataset (improves generalization)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # ── Loss Function ─────────────────────────────────────────────────────
+    # Focal Loss with class weights — critical for PIVD_Priformis vs PIVD_RA separation.
+    # Compute inverse-frequency class weights from training window distribution.
+    train_class_counts = np.bincount(
+        [w['label'] for w in train_dataset.windows], minlength=num_classes
+    )
+    class_weights = 1.0 / (train_class_counts.astype(float) + 1e-6)
+    class_weights = class_weights / class_weights.sum() * num_classes  # normalize to mean=1
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+    print(f"Class weights: {dict(zip(classes, class_weights.cpu().numpy().round(3)))}")
+
+    criterion = FocalLoss(
+        weight=class_weights,
+        gamma=args.focal_gamma,    # 2.0 = strong focus on hard examples; 0.0 = standard weighted CE
+        label_smoothing=0.02       # reduced from 0.1 — too much smoothing hurts minority classes
+    )
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
@@ -321,7 +354,7 @@ def main():
         )
         
         # Validate
-        val_loss, val_acc, val_f1, val_auc, _ = evaluate(model, val_loader, criterion, device, num_classes)
+        val_loss, val_acc, val_f1, val_auc, _, _, _ = evaluate(model, val_loader, criterion, device, num_classes)
         
         print(f"Epoch {epoch+1}/{args.epochs} | "
               f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} F1: {train_f1:.4f} | "
@@ -335,7 +368,9 @@ def main():
     print("\nTraining Complete. Evaluating on Test Set...")
     # Load best model for testing
     model.load_state_dict(torch.load(args.output_name))
-    test_loss, test_acc, test_f1, test_auc, test_cm = evaluate(model, test_loader, criterion, device, num_classes, desc="Testing")
+    test_loss, test_acc, test_f1, test_auc, test_cm, test_labels, test_preds = evaluate(
+        model, test_loader, criterion, device, num_classes, desc="Testing"
+    )
     
     print("\n=== Final Test Results ===")
     print(f"Loss: {test_loss:.4f}")
@@ -343,6 +378,10 @@ def main():
     print(f"F1 Score: {test_f1:.4f}")
     print(f"ROC-AUC: {test_auc:.4f}")
     print(f"Confusion Matrix:\n{test_cm}")
+    
+    # Per-class classification report (uses labels/preds already collected by evaluate)
+    print("\nDetailed Per-Class Report:")
+    print(classification_report(test_labels, test_preds, target_names=classes, zero_division=0))
 
 if __name__ == "__main__":
     main()

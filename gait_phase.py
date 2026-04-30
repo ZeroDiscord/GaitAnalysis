@@ -27,6 +27,7 @@ Column mapping (matches dataset.py convention):
 
 import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
+from scipy.interpolate import PchipInterpolator
 
 # ---------------------------------------------------------------------------
 # Constants — physiologically informed thresholds
@@ -428,13 +429,38 @@ def detect_gait_cycles(ta_env: np.ndarray,
     max_samples = int(_MAX_CYCLE_MS * fs / 1000)
 
     def _filter_starts(starts: np.ndarray) -> np.ndarray:
-        """Keep only onsets that produce valid inter-cycle gaps."""
+        """Greedy chain-building: walk forward from each accepted boundary,
+        skip sub-cycle events, and collect all valid cycle boundaries.
+        
+        The old logic only kept the LEFT index of each valid gap, which meant
+        a sequence like [159, 752, 1016, 1245] with gaps [593, 264, 229]
+        would keep only [159] (1 start — not enough for a single cycle).
+        
+        The new logic starts from the first onset, then greedily jumps to the
+        next onset that is >= min_samples away.  If that jump is also
+        <= max_samples, the destination is accepted as a cycle boundary.
+        If the jump is too large, it starts a new potential chain from there.
+        """
         if len(starts) < 2:
             return np.array([], dtype=np.int64)
-        gaps = np.diff(starts)
-        # Accept onset only if gap to next is within physiological range
-        keep = np.where((gaps >= min_samples) & (gaps <= max_samples))[0]
-        return starts[keep].astype(np.int64)
+        
+        chain = [starts[0]]  # Always seed with first onset
+        for i in range(1, len(starts)):
+            gap = starts[i] - chain[-1]
+            if gap < min_samples:
+                # Too close — sub-cycle event, skip
+                continue
+            elif gap <= max_samples:
+                # Valid inter-cycle gap — accept as next boundary
+                chain.append(starts[i])
+            else:
+                # Gap too large — start fresh chain from here
+                chain.append(starts[i])
+        
+        # Need at least 2 boundaries to form one cycle
+        if len(chain) < 2:
+            return np.array([], dtype=np.int64)
+        return np.array(chain, dtype=np.int64)
 
     def _valid(starts: np.ndarray) -> bool:
         return len(starts) >= 2
@@ -450,10 +476,11 @@ def detect_gait_cycles(ta_env: np.ndarray,
         if not all_onsets:
             return np.array([], dtype=np.int64)
             
-        # Deduplication window stringency reduced from min_samples to min_samples // 2.
-        # This prevents TA and GA onsets within the same actual cycle from deleting
-        # each other while still debouncing double-detections from the same burst.
-        dedup_win = min_samples // 2
+        # Deduplication window: only merge onsets that are within 100ms of each
+        # other (true double-detections from the same burst).  The previous value
+        # of min_samples // 2 = 200ms was too aggressive and merged genuinely
+        # separate TA/GA activation onsets that are 100-200ms apart.
+        dedup_win = min_samples // 4
         deduped = [all_onsets[0]]
         for ev in all_onsets[1:]:
             if (ev - deduped[-1]) >= dedup_win:
@@ -494,23 +521,204 @@ def detect_gait_cycles(ta_env: np.ndarray,
 
 # ---------------------------------------------------------------------------
 # Continuous gait phase output [0, 100] per timestep
+# EMG-activity-driven velocity with physiological landmark anchoring
 # ---------------------------------------------------------------------------
+#
+# Method (two-stage):
+#
+#   Stage 1 — EMG-driven raw phase:
+#     phase_velocity[t] = baseline + weight * activity_norm[t]
+#     raw_phase = cumsum(velocity) / total * 100
+#
+#     This produces a nonlinear monotonic curve where phase advances
+#     rapidly during muscle activations and slowly during quiet periods.
+#
+#   Stage 2 — Physiological landmark re-normalization:
+#     Within each cycle, detect two physiological events from the
+#     raw RMS envelopes:
+#
+#       1. GA peak         → terminal stance (~55%)
+#          The gastrocnemius peak corresponds to maximal push-off force.
+#
+#       2. GA→TA crossover → toe-off (~62%)
+#          The point where GA dominance gives way to TA dominance
+#          marks the stance-to-swing transition.
+#
+#     The raw phase is then piecewise re-normalized through these
+#     anchors, forcing GA peak → 55% and crossover → 62% while
+#     preserving the EMG-driven nonlinear shape within each segment.
+#
+# Reviewer-ready description:
+#   "Gait phase is computed as the normalized cumulative integral of
+#    instantaneous EMG activity (TA + GA RMS envelopes), with post-hoc
+#    piecewise re-normalization to anchor the gastrocnemius peak to 55%
+#    (terminal stance) and the GA–TA dominance crossover to 62%
+#    (toe-off). This ensures physiological events are consistently
+#    mapped to their expected phase positions while preserving the
+#    data-driven nonlinear phase progression within each sub-phase."
+#
+# ---------------------------------------------------------------------------
+
+_PHASE_BASELINE_WEIGHT = 0.15   # minimum phase velocity (prevents stalling)
+_PHASE_EMG_WEIGHT      = 0.85   # EMG modulation of phase rate
+
+# Physiological anchor targets (% of gait cycle)
+_ANCHOR_HEEL_STRIKE = 0.0    # cycle start = heel strike
+_ANCHOR_LOADING_END = 12.0   # end of loading response
+_ANCHOR_GA_PEAK     = 55.0   # terminal stance / push-off
+_ANCHOR_TOE_OFF     = 62.0   # stance → swing transition (GA→TA crossover)
+_ANCHOR_CYCLE_END   = 100.0
+
+
+def _anchor_phase_to_landmarks(raw_phase: np.ndarray,
+                                ta_cycle: np.ndarray,
+                                ga_cycle: np.ndarray,
+                                cycle_len: int) -> np.ndarray:
+    """
+    Re-normalize a raw EMG-driven phase curve so that explicitly
+    detected physiological events land at their expected gait-cycle
+    percentages.
+
+    Enforced anchors:
+        Heel strike (cycle start)  → 0%   (by definition)
+        Loading response end       → 12%  (TA deactivation after initial contact)
+        GA peak (push-off)         → 55%  (terminal stance)
+        GA→TA crossover (toe-off)  → 62%  (stance-to-swing transition)
+        Cycle end                  → 100%
+
+    The re-normalization uses a monotonic PCHIP (Piecewise Cubic
+    Hermite Interpolating Polynomial) through the anchor points,
+    producing a C1-continuous (no kinks) curve that preserves the
+    EMG-driven nonlinear shape within each segment.
+
+    If landmarks cannot be detected (e.g. very weak signal), the raw
+    EMG-driven phase is returned unmodified.
+    """
+    eps = 1e-12
+
+    # --- Anchor 1: Heel strike → 0% (implicit: cycle start = index 0) ---
+    # Already enforced: raw_phase[0] == 0.0 by construction.
+
+    # --- Anchor 2: Loading response end → 12% ---
+    # TA fires at heel strike for eccentric dorsiflexion control;
+    # loading ends when TA drops below 50% of its initial activation.
+    ta_peak_early = ta_cycle[:max(1, cycle_len // 4)].max()
+    loading_end_idx = None
+    if ta_peak_early > eps:
+        ta_early_norm = ta_cycle[:cycle_len // 2] / (ta_peak_early + eps)
+        below_half = np.where(ta_early_norm < 0.5)[0]
+        if len(below_half) > 0:
+            candidate = int(below_half[0])
+            if 0.05 * cycle_len < candidate < 0.35 * cycle_len:
+                loading_end_idx = candidate
+
+    # --- Anchor 3: GA peak → 55% (terminal stance / push-off) ---
+    ga_peak_idx = int(np.argmax(ga_cycle))
+    if not (0.10 * cycle_len < ga_peak_idx < 0.80 * cycle_len):
+        return raw_phase  # can't anchor — return raw
+
+    raw_at_ga_peak = float(raw_phase[ga_peak_idx])
+    if raw_at_ga_peak < 5.0 or raw_at_ga_peak > 95.0:
+        return raw_phase  # degenerate — peak at extreme edge
+
+    # --- Anchor 4: GA→TA crossover → 62% (toe-off) ---
+    # Dominance ratio: 1.0 = pure GA, 0.0 = pure TA
+    dominance = ga_cycle / (ga_cycle + ta_cycle + eps)
+    crossover_idx = None
+    post_peak_dom = dominance[ga_peak_idx:]
+    below_half = np.where(post_peak_dom < 0.5)[0]
+    if len(below_half) > 0:
+        crossover_idx = ga_peak_idx + int(below_half[0])
+        if crossover_idx <= ga_peak_idx or crossover_idx >= cycle_len - 1:
+            crossover_idx = None
+
+    # --- Build anchor map: raw_phase_value → target_phase_value ---
+    src = [0.0]     # heel strike
+    dst = [0.0]
+
+    # Loading response end (if detected)
+    if loading_end_idx is not None:
+        raw_at_loading = float(raw_phase[loading_end_idx])
+        if raw_at_loading > 1.0:  # must be past start
+            src.append(raw_at_loading)
+            dst.append(_ANCHOR_LOADING_END)
+
+    # GA peak (push-off)
+    if len(src) < 2 or raw_at_ga_peak > src[-1] + 1.0:
+        src.append(raw_at_ga_peak)
+        dst.append(_ANCHOR_GA_PEAK)
+
+    # GA→TA crossover (toe-off)
+    if crossover_idx is not None:
+        raw_at_crossover = float(raw_phase[crossover_idx])
+        if raw_at_crossover > src[-1] + 1.0:
+            src.append(raw_at_crossover)
+            dst.append(_ANCHOR_TOE_OFF)
+
+    src.append(100.0)   # cycle end
+    dst.append(_ANCHOR_CYCLE_END)
+
+    # --- Smooth monotonic re-normalization (PCHIP = C1 continuous) ---
+    # PCHIP preserves monotonicity and eliminates piecewise-linear kinks
+    if len(src) >= 3:
+        pchip = PchipInterpolator(src, dst)
+        anchored = pchip(raw_phase)
+        # Clamp to [0, 100] and enforce strict monotonicity
+        anchored = np.clip(anchored, 0.0, 100.0)
+        anchored = np.maximum.accumulate(anchored)
+    else:
+        # Too few anchors for PCHIP — fall back to linear
+        anchored = np.interp(raw_phase, src, dst)
+
+    return anchored
+
 
 def assign_gait_phase_continuous(ta_signal: np.ndarray,
                                   ga_signal: np.ndarray,
                                   fs: float = _FS_DEFAULT) -> np.ndarray:
     """
-    Compute a continuous gait phase percentage [0, 100] for every timestep.
+    Compute a continuous gait phase ∈ [0, 100] for every timestep.
 
-    This is the main function to call from dataset.py.
+    Algorithm (two-stage, EMG-anchored):
+
+      Stage 1 — EMG-driven phase velocity:
+        For each detected gait cycle, the raw RMS envelopes of the Tibialis
+        Anterior (TA) and Gastrocnemius (GA) are summed to form an
+        instantaneous total EMG activity signal.  Phase velocity at each
+        sample is v(t) = 0.15 + 0.85 · activity_norm(t), where
+        activity_norm is the cycle-peak-normalized total activity.  The
+        cumulative integral ∫v(t)dt, normalized to [0, 100], produces a
+        raw nonlinear phase that advances rapidly during gait events
+        (push-off, swing onset) and slowly during quiet periods (midstance).
+
+      Stage 2 — Physiological landmark anchoring:
+        Within each cycle, four explicit gait events are detected from
+        the raw RMS envelopes and forced to their canonical phase positions
+        via a monotonic PCHIP (C1-continuous) re-normalization:
+
+          Heel strike (cycle start)   → 0%   [TA burst onset]
+          Loading response end        → 12%  [TA deactivation]
+          GA peak (push-off)          → 55%  [max gastrocnemius RMS]
+          GA→TA crossover (toe-off)   → 62%  [GA/(GA+TA) < 0.5]
+
+        This ensures that the GA peak consistently maps to terminal stance
+        (~55%) and the stance-to-swing transition is explicitly defined at
+        the GA–TA dominance crossover (~62%), regardless of walking speed
+        or pathology.
+
     Output shape: (T,) float32
-
-    Healthy gait shows regular 0→100 cycling.  Pathological gait shows
-    distorted or compressed progressions — this is itself a discriminative feature!
     """
     n = len(ta_signal)
 
-    # Compute envelopes
+    # --- Raw RMS envelopes (same as visualization, NOT z-scored) ---
+    rms_win = max(2, int(_RMS_WINDOW_MS * fs / 1000))
+    ta_rms = _rolling_rms(np.abs(ta_signal.astype(np.float64)), rms_win)
+    ga_rms = _rolling_rms(np.abs(ga_signal.astype(np.float64)), rms_win)
+
+    # Total EMG activity at each timestep
+    activity = ta_rms + ga_rms
+
+    # --- Z-scored TKEO envelopes for cycle boundary detection only ---
     ta_env = emg_envelope(ta_signal.astype(np.float64), fs)
     ga_env = emg_envelope(ga_signal.astype(np.float64), fs)
 
@@ -521,10 +729,12 @@ def assign_gait_phase_continuous(ta_signal: np.ndarray,
     phase = np.zeros(n, dtype=np.float64)
 
     if len(cycle_starts) < 2 or method == "Linear_Fallback":
-        # Degenerate case: linear interpolation 0→100 across the whole signal
-        phase = np.linspace(0.0, 100.0, n)
+        # Degenerate case: EMG-proportional phase across entire signal
+        act_norm = activity / (activity.max() + 1e-12)
+        velocity = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
+        raw_phase = np.cumsum(velocity)
+        phase = raw_phase / (raw_phase[-1] + 1e-12) * 100.0
     else:
-        # Append sentinel end index for the last cycle
         boundaries = np.append(cycle_starts, n)
         for i in range(len(cycle_starts)):
             s = int(cycle_starts[i])
@@ -532,11 +742,38 @@ def assign_gait_phase_continuous(ta_signal: np.ndarray,
             cycle_len = e - s
             if cycle_len <= 0:
                 continue
-            phase[s:e] = np.linspace(0.0, 100.0, cycle_len)
 
-        # Fill any pre-first-cycle samples
+            # --- Stage 1: EMG-driven raw phase ---
+            act_cycle = activity[s:e]
+            act_peak = act_cycle.max()
+            if act_peak < 1e-12:
+                phase[s:e] = np.linspace(0.0, 100.0, cycle_len)
+                continue
+
+            act_norm = act_cycle / act_peak
+            velocity = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
+            raw_phase = np.cumsum(velocity)
+            raw_phase = raw_phase / raw_phase[-1] * 100.0
+
+            # --- Stage 2: Anchor to physiological landmarks ---
+            ta_cycle = ta_rms[s:e]
+            ga_cycle = ga_rms[s:e]
+            phase[s:e] = _anchor_phase_to_landmarks(
+                raw_phase, ta_cycle, ga_cycle, cycle_len
+            )
+
+        # Pre-first-cycle: EMG-driven loading phase [0, 12%]
         if cycle_starts[0] > 0:
-            phase[:cycle_starts[0]] = 0.0
+            pre_len = int(cycle_starts[0])
+            act_pre = activity[:pre_len]
+            act_peak = act_pre.max()
+            if act_peak > 1e-12:
+                act_norm = act_pre / act_peak
+                vel = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
+                raw = np.cumsum(vel)
+                phase[:pre_len] = raw / raw[-1] * 12.0
+            else:
+                phase[:pre_len] = np.linspace(0.0, 12.0, pre_len)
 
     return phase.astype(np.float32)
 

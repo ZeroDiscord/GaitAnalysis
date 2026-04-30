@@ -84,6 +84,9 @@ def plot_correlation_heatmap(df, output_dir):
     # Aggregate to patient-level to avoid within-subject autocorrelation
     patient_df = df.groupby(['patient_id', 'class_name']).mean(numeric_only=True).reset_index()
     corr = patient_df[feat_cols].corr()
+    # NaN correlations arise from gait phase features that failed extraction
+    # (returned NaN).  Fill with 0.0 (uncorrelated) so clustering doesn't crash.
+    corr = corr.fillna(0.0)
 
     g = sns.clustermap(corr, cmap='coolwarm', center=0,
                        linewidths=0.5, figsize=(max(12, len(feat_cols) * 0.45),
