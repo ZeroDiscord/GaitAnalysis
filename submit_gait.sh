@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N gaitAnalysis
 #PBS -q gpu
-#PBS -l select=1:ncpus=10:ngpus=1:mem=32g
+#PBS -l select=1:ncpus=10:ngpus=1:mem=128g
 #PBS -j oe
 #PBS -V 
 
