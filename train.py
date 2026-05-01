@@ -46,13 +46,10 @@ from prototype_head import PrototypeClassifier, HybridClassifier
 from models.bimamba_classifier import BiMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
 
-# Legacy models (still functional, kept in models/)
-try:
-    from models.native_mamba import MambaGaitClassifier
-    from models.triton_mamba import HardwareMambaGaitClassifier
-    LEGACY_AVAILABLE = True
-except ImportError:
-    LEGACY_AVAILABLE = False
+
+# Legacy models are lazy-loaded inside create_model() to avoid CUDA
+# memory allocation at import time (triton/mamba compile kernels on import).
+LEGACY_AVAILABLE = True
 
 
 # ---------------------------------------------------------------------------
@@ -117,28 +114,33 @@ def create_model(model_type: str, input_dim: int, num_classes: int,
             input_dim=input_dim, num_classes=num_classes,
             d_model=d_model, n_layers=n_layers, dropout=dropout,
         )
-    elif model_type == 'mamba' and LEGACY_AVAILABLE:
+    elif model_type == 'mamba':
+        try:
+            from models.native_mamba import MambaGaitClassifier
+        except ImportError:
+            raise ImportError("--model_type mamba requires mamba-ssm. Use --model_type bimamba instead.")
         model = MambaGaitClassifier(
             input_dim=input_dim, num_classes=num_classes,
             d_model=d_model, n_layers=n_layers,
         )
-    elif model_type == 'triton_mamba' and LEGACY_AVAILABLE:
+    elif model_type == 'triton_mamba':
+        try:
+            from models.triton_mamba import HardwareMambaGaitClassifier
+        except ImportError:
+            raise ImportError("--model_type triton_mamba requires triton. Use --model_type bimamba instead.")
         model = HardwareMambaGaitClassifier(
             input_dim=input_dim, num_classes=num_classes,
             d_model=d_model, n_layers=n_layers,
         )
     else:
-        available = 'bimamba, gru'
-        if LEGACY_AVAILABLE:
-            available += ', mamba, triton_mamba'
-        raise ValueError(f"Unknown model type: {model_type}. Available: {available}")
-    
+        raise ValueError(f"Unknown model type: {model_type}. Choose from: bimamba, gru, mamba, triton_mamba")
+
     # Replace classifier head with prototype head if requested
     if use_prototype_head and hasattr(model, 'classifier'):
         embed_dim = d_model
         model.classifier = HybridClassifier(embed_dim, num_classes, temperature=0.1)
         print(f"  Replaced classifier head with HybridClassifier (linear + prototype)")
-    
+
     return model
 
 
