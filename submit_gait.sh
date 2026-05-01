@@ -22,11 +22,11 @@ echo "--- GPU STATUS BEFORE TRAINING ---"
 nvidia-smi
 echo "----------------------------------"
 
-# 1. BiMamba — LOPO Cross-Validation
-echo "--- Starting BiMamba LOPO Training on H100 ---"
+# 1. GRU Baseline — LOPO Cross-Validation
+echo "--- Starting GRU LOPO Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
-    --model_type bimamba \
+    --model_type gru \
     --cv_mode lopo \
     --epochs 80 \
     --batch_size 16 \
@@ -41,11 +41,11 @@ python3 train.py \
     --num_workers 4 \
     --output_dir "checkpoints/"
 
-# 2. GRU Baseline — LOPO Cross-Validation
-echo "--- Starting GRU LOPO Training on H100 ---"
+# 2. BiMamba — LOPO Cross-Validation (WARNING: Slow without mamba_ssm)
+echo "--- Starting BiMamba LOPO Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
-    --model_type gru \
+    --model_type bimamba \
     --cv_mode lopo \
     --epochs 80 \
     --batch_size 16 \
