@@ -1,26 +1,61 @@
+"""
+train.py — Leave-One-Patient-Out Cross-Validation Training
+============================================================
+Gold-standard evaluation for small biomedical cohorts.
+Every patient gets exactly one turn as the test patient.
+Results are aggregated across all folds with mean +/- std.
+
+Supports:
+  - BiMamba (bidirectional Mamba) -- recommended
+  - GRU (bidirectional + non-causal attention)
+  - Prototype classifier head
+  - Focal loss with patient-level class weights
+  - Advanced augmentation pipeline
+  - Checkpoint config saving
+
+Usage:
+  python train.py --data_dir Datasets/ --model_type bimamba --epochs 60
+  python train.py --data_dir Datasets/ --model_type gru --epochs 60
+  python train.py --data_dir Datasets/ --model_type bimamba --use_prototype_head --epochs 60
+  python train.py --data_dir Datasets/ --model_type bimamba --cv_mode kfold --n_folds 5
+  python train.py --data_dir Datasets/ --model_type bimamba --single_fold
+"""
+
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score, classification_report
+from torch.utils.data import DataLoader
+from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
+                             classification_report, recall_score, roc_auc_score)
 import argparse
-from tqdm import tqdm
 import numpy as np
-import pandas as pd
-from dataset import create_dataloaders
-from feature_config import FeatureConfig
-from models.native_mamba import MambaGaitClassifier
-from models.official_mamba import OfficialMambaGaitClassifier
-from models.triton_mamba import HardwareMambaGaitClassifier
+import random
+from collections import defaultdict
+
+from dataset import (GaitDataset, collate_fn_pad, discover_dataset,
+                     patient_level_lopo_splits, patient_level_kfold_splits)
+from augmentations import AugmentationPipeline
+from checkpoint_utils import save_checkpoint, load_checkpoint, make_config
+from prototype_head import PrototypeClassifier, HybridClassifier
+
+# Model architectures
+from models.bimamba_classifier import BiMambaGaitClassifier
 from models.gru_baseline import GRUAttentionGaitClassifier
+
+# Legacy models (still functional, kept in models/)
+try:
+    from models.native_mamba import MambaGaitClassifier
+    from models.triton_mamba import HardwareMambaGaitClassifier
+    LEGACY_AVAILABLE = True
+except ImportError:
+    LEGACY_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
-# Focal Loss — drop-in replacement for nn.CrossEntropyLoss
-# Focuses gradient on hard-to-classify samples (PIVD_Priformis vs PIVD_RA).
-# gamma=2.0 means a 95%-confident correct prediction gets 400x less gradient
-# than a 50%-confused one, forcing the model to work on the hard boundary.
+# Focal Loss
 # ---------------------------------------------------------------------------
 class FocalLoss(nn.Module):
     def __init__(self, weight=None, gamma=2.0, label_smoothing=0.02):
@@ -50,338 +85,387 @@ class FocalLoss(nn.Module):
             return (focal_w * ce).mean()
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler, accum_steps=1, use_scaler=True):
+# ---------------------------------------------------------------------------
+# Seed
+# ---------------------------------------------------------------------------
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+def create_model(model_type: str, input_dim: int, num_classes: int,
+                 d_model: int, n_layers: int, dropout: float = 0.1,
+                 use_prototype_head: bool = False) -> nn.Module:
+    """Create model by type string."""
+    
+    if model_type == 'bimamba':
+        model = BiMambaGaitClassifier(
+            input_dim=input_dim, num_classes=num_classes,
+            d_model=d_model, n_layers=n_layers, dropout=dropout,
+        )
+    elif model_type == 'gru':
+        model = GRUAttentionGaitClassifier(
+            input_dim=input_dim, num_classes=num_classes,
+            d_model=d_model, n_layers=n_layers, dropout=dropout,
+        )
+    elif model_type == 'mamba' and LEGACY_AVAILABLE:
+        model = MambaGaitClassifier(
+            input_dim=input_dim, num_classes=num_classes,
+            d_model=d_model, n_layers=n_layers,
+        )
+    elif model_type == 'triton_mamba' and LEGACY_AVAILABLE:
+        model = HardwareMambaGaitClassifier(
+            input_dim=input_dim, num_classes=num_classes,
+            d_model=d_model, n_layers=n_layers,
+        )
+    else:
+        available = 'bimamba, gru'
+        if LEGACY_AVAILABLE:
+            available += ', mamba, triton_mamba'
+        raise ValueError(f"Unknown model type: {model_type}. Available: {available}")
+    
+    # Replace classifier head with prototype head if requested
+    if use_prototype_head and hasattr(model, 'classifier'):
+        embed_dim = d_model
+        model.classifier = HybridClassifier(embed_dim, num_classes, temperature=0.1)
+        print(f"  Replaced classifier head with HybridClassifier (linear + prototype)")
+    
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+def train_epoch(model, loader, criterion, optimizer, scheduler, device,
+                accum_steps=1, use_prototype=False):
     model.train()
     running_loss = 0.0
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
     nan_batches = 0
-
+    
     optimizer.zero_grad()
-    pbar = tqdm(dataloader, desc="Training", leave=False)
-    for i, (features, masks, labels) in enumerate(pbar):
+    for i, (features, masks, labels) in enumerate(loader):
         features = features.to(device)
         masks = masks.to(device)
         labels = labels.to(device)
-
-        # Select AMP dtype: bfloat16 on H100 (no scaler needed), float16 elsewhere
-        amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-        with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
-            outputs = model(features, masks)
+        
+        with torch.amp.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu',
+                                 enabled=device.type == 'cuda'):
+            if use_prototype and hasattr(model, 'get_embedding'):
+                embeddings = model.get_embedding(features, masks)
+                outputs = model.classifier(embeddings, labels)
+            else:
+                outputs = model(features, masks)
             loss = criterion(outputs, labels) / accum_steps
         
-        # NaN Guard: Skip corrupted batches to prevent permanent model poisoning
         if torch.isnan(loss) or torch.isinf(loss):
             nan_batches += 1
-            optimizer.zero_grad() # Flush any accumulated NaN gradients
+            optimizer.zero_grad()
             continue
         
-        # Backward pass: use GradScaler ONLY for float16, NOT bfloat16
-        if use_scaler:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        loss.backward()
         
-        # Step if we've reached the accumulation boundary
-        if (i + 1) % accum_steps == 0 or (i + 1) == len(dataloader):
-            if use_scaler:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            
-            scheduler.step()
+        if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
             optimizer.zero_grad()
-
-        running_loss += (loss.item() * accum_steps) * features.size(0)
         
+        if scheduler is not None:
+            scheduler.step()
+        
+        running_loss += (loss.item() * accum_steps) * features.size(0)
         _, preds = torch.max(outputs, 1)
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
-        
-        pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
-
-    if nan_batches > 0:
-        print(f"  WARNING: {nan_batches} batches had NaN/Inf loss and were skipped.")
-        
-    total_samples = len(dataloader.dataset) - nan_batches * dataloader.batch_size
-    epoch_loss = running_loss / max(total_samples, 1)
-    epoch_acc = accuracy_score(all_labels, all_preds) if all_labels else 0.0
-    epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if all_labels else 0.0
     
-    return epoch_loss, epoch_acc, epoch_f1
+    if nan_batches > 0:
+        print(f"  WARNING: {nan_batches} NaN batches skipped")
+    
+    total = max(len(loader.dataset), 1)
+    return running_loss / total, accuracy_score(all_labels, all_preds) if all_labels else 0.0
 
-def evaluate(model, dataloader, criterion, device, num_classes, desc="Validating"):
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, num_classes, use_prototype=False):
     model.eval()
     running_loss = 0.0
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc=desc, leave=False)
-        for features, masks, labels in pbar:
-            features = features.to(device)
-            masks = masks.to(device)
-            labels = labels.to(device)
-
-            amp_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', dtype=amp_dtype):
-                outputs = model(features, masks)
-                loss = criterion(outputs, labels)
-
-            running_loss += loss.item() * features.size(0)
-            
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
-            
-            # Convert bfloat16 explicitly to float32 before passing to numpy
-            all_probs.extend(probs.float().cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    avg_loss = running_loss / len(dataloader.dataset)
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    all_preds, all_labels, all_probs = [], [], []
     
-    # Compute ROC-AUC based on number of classes
-    try:
-        all_probs_np = np.array(all_probs)
-        if num_classes == 2:
-            auc = roc_auc_score(all_labels, all_probs_np[:, 1])
+    for features, masks, labels in loader:
+        features = features.to(device)
+        masks = masks.to(device)
+        labels = labels.to(device)
+        
+        if use_prototype and hasattr(model, 'get_embedding'):
+            embeddings = model.get_embedding(features, masks)
+            outputs = model.classifier(embeddings)
         else:
-            valid_classes = np.unique(all_labels)
-            if len(valid_classes) < 2:
-                auc = 0.0
-            else:
-                filtered_probs = all_probs_np[:, valid_classes]
-                row_sums = filtered_probs.sum(axis=1, keepdims=True)
-                row_sums[row_sums == 0] = 1e-9
-                filtered_probs = filtered_probs / row_sums
-                auc = roc_auc_score(
-                    all_labels, filtered_probs, 
-                    multi_class='ovr', labels=valid_classes
-                )
-    except Exception as e:
-        auc = 0.0
+            outputs = model(features, masks)
         
-    cm = confusion_matrix(all_labels, all_preds)
+        loss = criterion(outputs, labels)
+        running_loss += loss.item() * features.size(0)
+        
+        probs = F.softmax(outputs.float(), dim=1)
+        _, preds = torch.max(outputs, 1)
+        all_probs.extend(probs.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+    
+    total = max(len(loader.dataset), 1)
+    avg_loss = running_loss / total
+    acc = accuracy_score(all_labels, all_preds)
+    wf1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    mf1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    recalls = recall_score(all_labels, all_preds, average=None,
+                          labels=list(range(num_classes)), zero_division=0)
+    min_recall = float(np.min(recalls)) if len(recalls) > 0 else 0.0
+    
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
+    
+    return {
+        'loss': avg_loss, 'acc': acc, 'weighted_f1': wf1, 'macro_f1': mf1,
+        'min_recall': min_recall, 'recalls': recalls, 'cm': cm,
+        'labels': all_labels, 'preds': all_preds, 'probs': all_probs,
+    }
 
-    return avg_loss, acc, f1, auc, cm, all_labels, all_preds
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description='Train Mamba Gait Classifier')
-    parser.add_argument('--data_dir', type=str, default='Datasets/', help='Directory containing the dataset')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size (keep small, e.g., 2 or 4, for full sequences)')
-    parser.add_argument('--accum_steps', type=int, default=8, help='Gradient accumulation steps to simulate larger batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--d_model', type=int, default=64, help='Model hidden dimension')
-    parser.add_argument('--n_layers', type=int, default=2, help='Number of Mamba layers')
-    parser.add_argument('--use_triton_mamba', action='store_true', help='Use True Fused Triton/CUDA Hardware-Accelerated Mamba Module')
-    parser.add_argument('--use_official_mamba', action='store_true', help='Use the official mamba-ssm package (requires causal-conv1d and mamba-ssm to be pip installed)')
-    parser.add_argument('--use_gru_baseline', action='store_true', help='Use the GRU+Attention baseline model instead of Mamba for comparison')
-    parser.add_argument('--output_name', type=str, default='best_model.pth', help='Filename to save the best model weights (e.g., mamba_best.pth)')
-    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal loss gamma (0 = standard CE, 2 = strong focus on hard examples)')
-    
-    # Enhanced feature arguments
-    parser.add_argument('--enhanced_features', action='store_true', help='Use enhanced feature extraction (17+ features)')
-    parser.add_argument('--legacy_mode', action='store_true', help='Force legacy mode (5 features) even with enhanced_features flag')
-    parser.add_argument('--enable_pca', action='store_true', help='Enable PCA dimensionality reduction')
-    parser.add_argument('--pca_components', type=int, default=10, help='Number of PCA components')
-    parser.add_argument('--enable_ica', action='store_true', help='Enable ICA dimensionality reduction')
-    parser.add_argument('--ica_components', type=int, default=8, help='Number of ICA components')
-    
+    parser = argparse.ArgumentParser(description='LOPO CV Training for Gait Classification')
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--model_type', type=str, default='bimamba',
+                        choices=['bimamba', 'gru', 'mamba', 'triton_mamba'])
+    parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--accum_steps', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--n_layers', type=int, default=2)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--focal_gamma', type=float, default=2.0)
+    parser.add_argument('--window_size', type=int, default=2000)
+    parser.add_argument('--stride', type=int, default=1000)
+    parser.add_argument('--use_prototype_head', action='store_true')
+    parser.add_argument('--cv_mode', type=str, default='lopo', choices=['lopo', 'kfold'])
+    parser.add_argument('--n_folds', type=int, default=5, help='Number of folds for kfold mode')
+    parser.add_argument('--single_fold', action='store_true', help='Run only first fold')
+    parser.add_argument('--output_dir', type=str, default='checkpoints/')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--patience', type=int, default=20)
     args = parser.parse_args()
-
-    # Configure feature extraction
-    if args.enhanced_features and not args.legacy_mode:
-        feature_config = FeatureConfig(
-            legacy_mode=False,
-            include_base_features=True,
-            include_time_domain=True,
-            include_freq_domain=True,
-            include_gait_cycle=True,
-            enable_pca=args.enable_pca,
-            pca_components=args.pca_components,
-            enable_ica=args.enable_ica,
-            ica_components=args.ica_components,
-            enable_feature_caching=True
-        )
-        print("Using Enhanced Feature Mode:")
-        print(f"  - Total features: {feature_config.get_total_feature_count()}")
-        print(f"  - PCA: {'Enabled' if args.enable_pca else 'Disabled'}")
-        print(f"  - ICA: {'Enabled' if args.enable_ica else 'Disabled'}")
+    
+    set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+    print(f"Model: {args.model_type} | d_model={args.d_model} | n_layers={args.n_layers}")
+    print(f"CV mode: {args.cv_mode}")
+    
+    # Get splits
+    if args.cv_mode == 'lopo':
+        splits = list(patient_level_lopo_splits(args.data_dir))
     else:
-        feature_config = None
-        print("Using Legacy Feature Mode (5 features)")
-
-    # Create dummy data if folder doesn't exist or is empty just for testing pipeline setup
-    has_data = False
-    if os.path.exists(args.data_dir):
-        for root, dirs, files in os.walk(args.data_dir):
-            if any(f.endswith('.csv') for f in files):
-                has_data = True
-                break
-                
-    if not has_data:
-        print(f"Creating dummy dataset at {args.data_dir} for testing...")
-        os.makedirs(os.path.join(args.data_dir, "01_Normal"), exist_ok=True)
-        os.makedirs(os.path.join(args.data_dir, "02_Pathological"), exist_ok=True)
+        splits = list(patient_level_kfold_splits(args.data_dir, args.n_folds, args.seed))
+    
+    n_folds = 1 if args.single_fold else len(splits)
+    all_fold_results = []
+    
+    # Augmentation pipeline
+    train_aug = AugmentationPipeline.default_emg()
+    
+    for fold_idx in range(n_folds):
+        split = splits[fold_idx]
+        train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, \
+            class_to_idx, classes, fold_name = split
         
-        for i in range(20):
-            seq_len = np.random.randint(50, 150)
-            df_norm = pd.DataFrame({
-                'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len),
-                'E_ago': np.cos(np.linspace(0, 10, seq_len)) + np.random.normal(0, 0.1, seq_len)
-            })
-            df_norm.to_csv(os.path.join(args.data_dir, "01_Normal", f"sample_{i}.csv"), index=False, header=False)
+        num_classes = len(classes)
+        
+        print(f"\n{'='*60}")
+        print(f"  FOLD {fold_idx + 1}/{n_folds} -- {fold_name}")
+        print(f"{'='*60}")
+        print(f"  Train: {len(train_paths)} files | Val: {len(val_paths)} | Test: {len(test_paths)}")
+        
+        set_seed(args.seed + fold_idx)  # Different seed per fold for model init
+        
+        # Create datasets
+        train_ds = GaitDataset(
+            train_paths, train_labels, class_to_idx,
+            window_size=args.window_size, base_stride=args.stride, mode='train',
+            balance_classes=True, augmentation=train_aug,
+        )
+        
+        g_mean, g_std = train_ds.global_mean, train_ds.global_std
+        input_dim = train_ds.get_feature_count()
+        
+        val_ds = GaitDataset(
+            val_paths, val_labels, class_to_idx,
+            window_size=args.window_size, base_stride=args.stride, mode='val',
+            global_mean=g_mean, global_std=g_std, balance_classes=False,
+        )
+        
+        test_ds = GaitDataset(
+            test_paths, test_labels, class_to_idx,
+            window_size=args.window_size, base_stride=args.stride, mode='test',
+            global_mean=g_mean, global_std=g_std, balance_classes=False,
+        )
+        
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  collate_fn=collate_fn_pad)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                collate_fn=collate_fn_pad)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                                 collate_fn=collate_fn_pad)
+        
+        # Class weights from PATIENT counts (not window counts)
+        patient_counts = train_ds.get_patient_class_counts()
+        class_weights = 1.0 / (patient_counts.astype(float) + 1e-6)
+        class_weights = class_weights / class_weights.sum() * num_classes
+        class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        print(f"  Patient-level class weights: {dict(zip(classes, class_weights.cpu().numpy().round(2)))}")
+        
+        # Loss
+        criterion = FocalLoss(weight=class_weights, gamma=args.focal_gamma, label_smoothing=0.02)
+        
+        # Model
+        model = create_model(
+            args.model_type, input_dim, num_classes,
+            args.d_model, args.n_layers, args.dropout,
+            use_prototype_head=args.use_prototype_head,
+        ).to(device)
+        
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Trainable params: {param_count:,}")
+        
+        # Optimizer + scheduler
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.02)
+        steps_per_epoch = len(train_loader)
+        total_steps = max(args.epochs * steps_per_epoch, 2)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.lr, total_steps=total_steps,
+            pct_start=0.1, anneal_strategy='cos',
+        )
+        
+        # Training loop
+        best_macro_f1 = -1.0
+        patience_counter = 0
+        ckpt_path = os.path.join(args.output_dir, f'best_{fold_name}.pth')
+        
+        for epoch in range(args.epochs):
+            train_loss, train_acc = train_epoch(
+                model, train_loader, criterion, optimizer, scheduler, device,
+                accum_steps=args.accum_steps, use_prototype=args.use_prototype_head,
+            )
             
-            df_patho = pd.DataFrame({
-                'E_ant': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len),
-                'E_ago': np.sin(np.linspace(0, 10, seq_len)) + np.random.normal(0.5, 0.2, seq_len)
-            })
-            df_patho.to_csv(os.path.join(args.data_dir, "02_Pathological", f"sample_{i}.csv"), index=False, header=False)
-
-    print("Initializing Data Loaders with Sliding Window...")
-    train_loader, val_loader, test_loader, train_dataset = create_dataloaders(
-        args.data_dir, 
-        batch_size=args.batch_size,
-        window_size=2000,
-        base_stride=1000,
-        feature_config=feature_config
-    )
-    classes = train_dataset.classes
-    num_classes = len(classes)
-    print(f"Detected {num_classes} classes: {classes}")
-    
-    # Get actual input dimension from dataset
-    input_dim = train_dataset.get_feature_count()
-    print(f"Input dimension: {input_dim} features per timestep")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Model Initialization
-    # Cap d_model and n_layers for 38-patient dataset robustness
-    d_model_eff = args.d_model if args.d_model <= 32 else 32
-    n_layers_eff = args.n_layers if args.n_layers <= 2 else 2
-    
-    if args.use_official_mamba:
-        print(f"Initializing **OFFICIAL mamba-ssm** Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
-        model = OfficialMambaGaitClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            d_model=d_model_eff,
-            n_layers=n_layers_eff
-        ).to(device)
-    elif args.use_triton_mamba:
-        print(f"Initializing **HARDWARE-ACCELERATED** Triton Mamba Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
-        model = HardwareMambaGaitClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            d_model=d_model_eff,
-            n_layers=n_layers_eff,
-            chunk_size=2048
-        ).to(device)
-    elif args.use_gru_baseline:
-        print(f"Initializing **BASELINE** GRU+Attention Classifier (d_model={d_model_eff}, layers={n_layers_eff})")
-        model = GRUAttentionGaitClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            d_model=d_model_eff,
-            num_heads=4,
-            n_layers=n_layers_eff
-        ).to(device)
-    else:
-        model = MambaGaitClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            d_model=d_model_eff,
-            n_layers=n_layers_eff
-        ).to(device)
+            val_results = evaluate(
+                model, val_loader, criterion, device, num_classes,
+                use_prototype=args.use_prototype_head,
+            )
+            
+            selection_score = val_results['macro_f1']
+            
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                print(f"  Epoch {epoch+1:3d}/{args.epochs} | "
+                      f"Train Loss: {train_loss:.4f} Acc: {train_acc:.3f} | "
+                      f"Val Loss: {val_results['loss']:.4f} Acc: {val_results['acc']:.3f} "
+                      f"MF1: {val_results['macro_f1']:.3f} MinRecall: {val_results['min_recall']:.3f}")
+            
+            if selection_score > best_macro_f1:
+                best_macro_f1 = selection_score
+                patience_counter = 0
+                config = make_config(
+                    args.model_type, input_dim, num_classes,
+                    args.d_model, args.n_layers,
+                    dropout=args.dropout, use_prototype=args.use_prototype_head,
+                )
+                save_checkpoint(model, config, ckpt_path, extra={
+                    'epoch': epoch, 'best_macro_f1': best_macro_f1,
+                    'fold': fold_name,
+                })
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= args.patience:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
         
-    # ── Loss Function ─────────────────────────────────────────────────────
-    # Focal Loss with class weights — critical for PIVD_Priformis vs PIVD_RA separation.
-    # Compute inverse-frequency class weights from training window distribution.
-    train_class_counts = np.bincount(
-        [w['label'] for w in train_dataset.windows], minlength=num_classes
-    )
-    class_weights = 1.0 / (train_class_counts.astype(float) + 1e-6)
-    class_weights = class_weights / class_weights.sum() * num_classes  # normalize to mean=1
-    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
-    print(f"Class weights: {dict(zip(classes, class_weights.cpu().numpy().round(3)))}")
-
-    criterion = FocalLoss(
-        weight=class_weights,
-        gamma=args.focal_gamma,    # 2.0 = strong focus on hard examples; 0.0 = standard weighted CE
-        label_smoothing=0.02       # reduced from 0.1 — too much smoothing hurts minority classes
-    )
-    
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    
-    # Initialize robust Learning Rate Scheduler (OneCycleLR for stable warm-up and cool-down)
-    total_steps = int(args.epochs * np.ceil(len(train_loader) / args.accum_steps))
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=args.lr, total_steps=total_steps,
-        pct_start=0.1, anneal_strategy='cos'
-    )
-    
-    # Mixed Precision Setup:
-    # CRITICAL: GradScaler is ONLY for float16. bfloat16 has float32's exponent range
-    # and does NOT need loss scaling. Using GradScaler with bfloat16 silently corrupts
-    # Mamba's sequential state recurrence, causing permanent NaN.
-    use_bf16 = device.type == 'cuda' and torch.cuda.is_bf16_supported()
-    if use_bf16:
-        print("H100/bfloat16 detected: GradScaler DISABLED (not needed for bf16).")
-        scaler = None
-        use_scaler = False
-    else:
-        scaler = torch.amp.GradScaler(device.type if device.type != 'mps' else 'cpu')
-        use_scaler = True
-
-    best_val_f1 = 0.0
-
-    print("Starting Training Loop...")
-    for epoch in range(args.epochs):
-        # Train
-        train_loss, train_acc, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, scheduler, 
-            accum_steps=args.accum_steps, use_scaler=use_scaler
+        # Test with best checkpoint
+        state_dict, _, _ = load_checkpoint(ckpt_path, device)
+        model.load_state_dict(state_dict)
+        
+        test_results = evaluate(
+            model, test_loader, criterion, device, num_classes,
+            use_prototype=args.use_prototype_head,
         )
         
-        # Validate
-        val_loss, val_acc, val_f1, val_auc, _, _, _ = evaluate(model, val_loader, criterion, device, num_classes)
+        print(f"\n  Fold {fold_idx+1} Test Results:")
+        print(f"  Acc={test_results['acc']:.3f} WF1={test_results['weighted_f1']:.3f} "
+              f"MF1={test_results['macro_f1']:.3f} MinRecall={test_results['min_recall']:.3f}")
+        print(f"  Per-class recall: {dict(zip(classes, test_results['recalls'].round(3)))}")
+        print(classification_report(
+            test_results['labels'], test_results['preds'],
+            labels=list(range(num_classes)), target_names=classes, zero_division=0))
         
-        print(f"Epoch {epoch+1}/{args.epochs} | "
-              f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} F1: {train_f1:.4f} | "
-              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f} AUC: {val_auc:.4f}")
-              
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            torch.save(model.state_dict(), args.output_name)
-            print(f"  --> Saved new best model to {args.output_name}!")
-
-    print("\nTraining Complete. Evaluating on Test Set...")
-    # Load best model for testing
-    model.load_state_dict(torch.load(args.output_name))
-    test_loss, test_acc, test_f1, test_auc, test_cm, test_labels, test_preds = evaluate(
-        model, test_loader, criterion, device, num_classes, desc="Testing"
-    )
+        all_fold_results.append({
+            'fold': fold_name,
+            'acc': test_results['acc'],
+            'weighted_f1': test_results['weighted_f1'],
+            'macro_f1': test_results['macro_f1'],
+            'min_recall': test_results['min_recall'],
+            'recalls': test_results['recalls'],
+            'labels': test_results['labels'],
+            'preds': test_results['preds'],
+        })
     
-    print("\n=== Final Test Results ===")
-    print(f"Loss: {test_loss:.4f}")
-    print(f"Accuracy: {test_acc:.4f}")
-    print(f"F1 Score: {test_f1:.4f}")
-    print(f"ROC-AUC: {test_auc:.4f}")
-    print(f"Confusion Matrix:\n{test_cm}")
+    # -- Aggregate Results --
+    print(f"\n{'='*60}")
+    print(f"  AGGREGATED RESULTS ({n_folds} folds)")
+    print(f"{'='*60}")
     
-    # Per-class classification report (uses labels/preds already collected by evaluate)
-    print("\nDetailed Per-Class Report:")
-    print(classification_report(test_labels, test_preds, target_names=classes, zero_division=0))
+    accs = [r['acc'] for r in all_fold_results]
+    wf1s = [r['weighted_f1'] for r in all_fold_results]
+    mf1s = [r['macro_f1'] for r in all_fold_results]
+    min_recalls = [r['min_recall'] for r in all_fold_results]
+    
+    print(f"  Accuracy:      {np.mean(accs):.3f} +/- {np.std(accs):.3f}")
+    print(f"  Weighted F1:   {np.mean(wf1s):.3f} +/- {np.std(wf1s):.3f}")
+    print(f"  Macro F1:      {np.mean(mf1s):.3f} +/- {np.std(mf1s):.3f}")
+    print(f"  Min Recall:    {np.mean(min_recalls):.3f} +/- {np.std(min_recalls):.3f}")
+    
+    # Per-class recall aggregation
+    if all_fold_results:
+        all_recalls = np.array([r['recalls'] for r in all_fold_results])
+        _, all_labels_list, class_to_idx, classes = discover_dataset(args.data_dir)
+        print(f"\n  Per-class recall (mean +/- std):")
+        for c_idx, c_name in enumerate(classes):
+            if c_idx < all_recalls.shape[1]:
+                print(f"    {c_name:20s}: {np.mean(all_recalls[:, c_idx]):.3f} +/- {np.std(all_recalls[:, c_idx]):.3f}")
+    
+    # Pooled classification report
+    all_labels_pooled = []
+    all_preds_pooled = []
+    for r in all_fold_results:
+        all_labels_pooled.extend(r['labels'])
+        all_preds_pooled.extend(r['preds'])
+    
+    if all_labels_pooled:
+        print(f"\n  Pooled Classification Report (all folds):")
+        print(classification_report(
+            all_labels_pooled, all_preds_pooled,
+            labels=list(range(num_classes)), target_names=classes, zero_division=0))
+    
+    print(f"\n  Checkpoints saved to: {args.output_dir}/")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

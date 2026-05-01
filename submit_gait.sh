@@ -5,41 +5,49 @@
 #PBS -j oe
 #PBS -V 
 
-# Navigate explicitly to the folder to bypass PBS_O_WORKDIR quote expansion errors
 cd "/home/aantriksh.124259/GaitAnalysis-dev"
 
-# Setup environment using Conda
 source /home/soft/anaconda3/etc/profile.d/conda.sh
 conda activate gait_env
 module load cuda
 
 
-# 1. Run Mamba Training
-echo "--- Starting Mamba Training on H100 ---"
+# 1. BiMamba — LOPO Cross-Validation (recommended)
+echo "--- Starting BiMamba LOPO Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
-    --epochs 150 \
+    --model_type bimamba \
+    --cv_mode lopo \
+    --epochs 80 \
     --batch_size 16 \
     --accum_steps 2 \
     --lr 5e-4 \
-    --dropout 0.4 \
-    --weight_decay 0.05 \
-    --patience 15 \
-    --use_triton_mamba \
-    --enhanced_features \
-    --output_name "best_mamba_model.pth"
+    --d_model 64 \
+    --n_layers 2 \
+    --dropout 0.1 \
+    --patience 20 \
+    --output_dir "checkpoints/"
 
-# 2. Run GRU Baseline Training
-echo "--- Starting GRU Baseline Training on H100 ---"
+# 2. GRU Baseline — LOPO Cross-Validation
+echo "--- Starting GRU LOPO Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
-    --epochs 150 \
+    --model_type gru \
+    --cv_mode lopo \
+    --epochs 80 \
     --batch_size 16 \
     --accum_steps 2 \
     --lr 5e-4 \
-    --dropout 0.4 \
-    --weight_decay 0.05 \
-    --patience 15 \
-    --use_gru_baseline \
-    --enhanced_features \
-    --output_name "best_gru_baseline.pth"
+    --d_model 64 \
+    --n_layers 2 \
+    --dropout 0.1 \
+    --patience 20 \
+    --output_dir "checkpoints/"
+
+# 3. Evaluate best BiMamba checkpoint
+echo "--- Evaluating BiMamba ---"
+python3 evaluate.py \
+    --model_path "checkpoints/best_sample_0.csv.pth" \
+    --data_dir "/home/aantriksh.124259/Datasets" \
+    --output_plot "confusion_bimamba.png" \
+    --benchmark

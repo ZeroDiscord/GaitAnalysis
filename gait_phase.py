@@ -980,10 +980,16 @@ if __name__ == "__main__":
     duration = 6.0  # seconds
     t = np.arange(int(fs * duration))
 
-    # Simulate healthy gait: TA fires at 5Hz in swing, GA fires offset by half-cycle
+    # Simulate healthy gait: TA fires in swing, GA fires offset by half-cycle
+    # Raw EMG is a high-frequency signal (~100Hz) modulated by a low-frequency envelope (1Hz)
     freq_hz = 1.0          # 1 gait cycle per second (60 steps/min)
-    ta_sim = np.clip(np.sin(2 * np.pi * freq_hz * t / fs), 0, None) + 0.05 * np.random.randn(len(t))
-    ga_sim = np.clip(np.sin(2 * np.pi * freq_hz * t / fs + np.pi), 0, None) + 0.05 * np.random.randn(len(t))
+    carrier_freq = 100.0   # Simulated EMG motor unit action potential frequency
+    
+    ta_env = np.clip(np.sin(2 * np.pi * freq_hz * t / fs), 0, None)
+    ga_env = np.clip(np.sin(2 * np.pi * freq_hz * t / fs + np.pi), 0, None)
+    
+    ta_sim = ta_env * np.sin(2 * np.pi * carrier_freq * t / fs) + 0.05 * np.random.randn(len(t))
+    ga_sim = ga_env * np.sin(2 * np.pi * carrier_freq * t / fs) + 0.05 * np.random.randn(len(t))
 
     phase_out = assign_gait_phase_continuous(ta_sim, ga_sim, fs)
     print(f"Phase output shape : {phase_out.shape}")

@@ -1,359 +1,97 @@
-***Note: Run `train.py` with the `--enhanced_features` flag to use all 22 top features***
+# Gait Analysis — Robust Pathology Classification
+
+A research-grade pipeline for classifying gait pathology (e.g., PIVD, Piriformis Syndrome) using EMG-driven muscle activation data. This repository implements state-of-the-art architectures including Bidirectional Mamba (BiMamba) and Attention-enhanced GRUs with a focus on robustness to small, imbalanced biomedical cohorts.
+
+## 🚀 Key Features
+
+*   **Unified Pipeline**: Clean, modular structure for training (`train.py`) and evaluation (`evaluate.py`).
+*   **State-of-the-Art Models**:
+    *   **BiMamba**: Bidirectional Mamba with padding-aware state resets and gated fusion.
+    *   **GRU+Attention**: Bidirectional GRU with non-causal multi-head attention pooling.
+*   **Robust Evaluation**: Built-in Leave-One-Patient-Out (LOPO) and Stratified K-Fold cross-validation to prevent data leakage.
+*   **Imbalance Handling**: 
+    *   **Focal Loss** with patient-level inverse-frequency weighting.
+    *   **Hybrid Prototype Classifier**: Distance-based classification to prevent minority class collapse.
+*   **Advanced Augmentation**: Physiological EMG augmentations (time-warping, channel dropout, magnitude warping) via `augmentations.py`.
+
 ---
-# Biomechanics-Informed Gait Pathology Classification
 
-> **A PyTorch pipeline using hardware-accelerated Mamba SSMs and physics-informed EMG features to classify clinical gait pathologies from extreme-length time-series.**
-
-Classifies gait pathologies (**Healthy, Hemiplegia, PIVD-RA, PIVD-Piriformis, Osteoarthritis**) from raw dual-channel EMG recordings (E_ant, E_ago). The system automatically computes physics-derived features (Torque, Joint Stiffness), physiologically anchored gait phase, and trains end-to-end classifiers over sequences of 26,000+ timesteps using State-Space Models (Mamba) and GRU+Attention baselines.
-
----
-
-## Project Layout
+## 📂 Project Structure
 
 ```
-Gait Analysis/
-|-- dataset.py                  # DataLoader, physics features, sliding window, normalization
-|-- train.py                    # Training loop (Focal Loss, AMP, gradient accumulation)
-|-- evaluate.py                 # Evaluation with inference benchmarking
-|-- feature_config.py           # Feature selection config (legacy 5 / enhanced 22 features)
-|-- gait_phase.py               # EMG-anchored gait cycle phase extraction
-|-- models/
-|   |-- native_mamba.py         # Pure-PyTorch Mamba SSM (default, fully portable)
-|   |-- triton_mamba.py         # Fused Triton/CUDA Mamba with chunked streaming
-|   |-- official_mamba.py       # Wrapper for pip mamba-ssm (Gu & Dao)
-|   +-- gru_baseline.py        # GRU + FlashAttention baseline
-|-- EDA/
-|   |-- eda_features.py         # Feature extraction (time + frequency domain)
-|   |-- eda_visualization.py    # Scatter, heatmap, PCA, LDA, gait phase plots
-|   |-- eda_runner.py           # CLI entry point for full EDA pipeline
-|   +-- outputs/                # Generated plots and CSV
-|-- submit_gait.sh              # PBS job script for HPC (H100 GPU)
-|-- connect_hpc.bat             # Windows SSH helper for HPC access
-|-- Dockerfile                  # Container build
-+-- Datasets/
-    |-- 1_Healthy/              # Patient CSVs (2-column: E_ago, E_ant)
-    |-- 3_Hemiplegia/
-    |-- 5_PIVD_RA/
-    |-- 6_PIVD_Priformis/
-    +-- 8_Osteoarthiritis/
+GaitAnalysis/
+├── models/
+│   ├── bimamba_classifier.py    # Bidirectional Mamba (Recommended)
+│   ├── gru_baseline.py          # Bidirectional GRU + Attention
+│   └── native_mamba.py          # Original Mamba architecture
+├── legacy/                      # Archived research iterations
+├── dataset.py                   # Per-window feature extraction & data loading
+├── train.py                     # LOPO/K-Fold Training Entry Point
+├── evaluate.py                  # Checkpoint-aware Evaluation (Auto-detects config)
+├── augmentations.py             # EMG signal augmentation pipeline
+├── prototype_head.py            # Prototypical network components
+├── checkpoint_utils.py          # Architecture-baked checkpointing
+├── gait_phase.py                # Physiological gait phase computation
+└── submit_gait.sh               # HPC job submission script (PBS/Torque)
 ```
-
-Each CSV contains two headerless columns: **column 0** = Agonist EMG (E_ago), **column 1** = Antagonist EMG (E_ant).
 
 ---
 
-## Data Pipeline
-
-### Physics-Informed Feature Engineering
-
-From the two raw EMG channels, five input features are computed per timestep (legacy mode):
-
-| Feature | Formula | Clinical Meaning |
-|---------|---------|-----------------|
-| E_ant | raw column 1 | Antagonist muscle activation |
-| E_ago | raw column 0 | Agonist muscle activation |
-| Torque | alpha * E_ant - beta * E_ago | Net joint torque proxy |
-| Stiffness | E_ant + E_ago | Co-contraction / joint stiffness index |
-| Gait Phase | EMG-anchored phase in [0, 100] | Cycle position with physiological landmarks |
-
-### Gait Phase Extraction (v3.0)
-
-The gait phase signal is computed via a **two-stage EMG-anchored algorithm** in `gait_phase.py`:
-
-**Stage 1 -- EMG-driven phase velocity:**
-
-```
-v(t) = 0.15 + 0.85 * activity_norm(t)
-```
-
-where `activity_norm` is the cycle-peak-normalized sum of TA and GA raw RMS envelopes. The cumulative integral of `v(t)`, normalized to [0, 100], produces a nonlinear phase that advances rapidly during gait events and slowly during quiet periods.
-
-**Stage 2 -- Physiological landmark anchoring:**
-
-Four explicit gait events are detected from raw RMS envelopes and forced to their canonical phase positions via monotonic PCHIP (C1-continuous) re-normalization:
-
-| Event | Detection Method | Anchored Phase |
-|-------|-----------------|----------------|
-| Heel strike | Cycle start (TA burst onset) | 0% |
-| Loading response end | TA deactivation below 50% | 12% |
-| Push-off (GA peak) | Max gastrocnemius RMS | 55% |
-| Toe-off (GA->TA crossover) | GA/(GA+TA) < 0.5 | 62% |
-
-### Enhanced Feature Mode (22 features)
-
-With `--enhanced_features`, the pipeline extracts 22 features per timestep selected by Random Forest Permutation Importance:
-
-| Group | Count | Features |
-|-------|-------|----------|
-| Base | 5 | e_ant, e_ago, torque, stiffness, gait_phase |
-| Time-domain | 10 | SSC, WL, ZCR, IEMG, Variance, MAV, RMS (per channel) |
-| Frequency-domain | 6 | Spectral entropy, mean/median/peak freq, total power |
-| Gait cycle | 1 | Propulsion phase duration |
-
-Feature selection is configured in `feature_config.py`.
-
-### Sliding Window Segmentation
-
-Raw sequences (26,000+ timesteps) are sliced into 2,000-sample windows:
-- **Dynamic stride balancing**: Minority classes get a smaller stride, natively equalizing window counts without loss reweighting.
-- **Temporal jittering**: +/- 5% boundary randomization during training for phase invariance.
-- **Random scaling**: 0.9-1.1x amplitude augmentation.
-
-### Normalization & Splitting
-
-- **Patient-level splitting**: Strict isolation of entire patient files into Train/Val/Test *before* windowing -- zero data leakage.
-- **Global normalization**: Mean/std computed on training windows only, frozen for val/test.
-- **Hard clamping**: Outliers clamped to [-10, 10] to prevent gradient explosions.
-
----
-
-## Model Architectures
-
-All models accept input shape `(batch, seq_len, input_dim)` and output class logits.
-
-### 1. Native PyTorch Mamba *(default)*
-
-`models/native_mamba.py` -- Fully portable, no CUDA dependencies.
-
-- Selective state-space recurrence with learnable A, B, C, D matrices
-- 1D depthwise convolution for local context
-- SiLU-gated residual connections
-- **Stability features**: float32 recurrence (prevents bfloat16 drift), periodic state clamping (every 100 steps), transition matrix clamping, dt softplus clamping [-20, 5]
-
-### 2. Triton/CUDA Mamba
-
-`models/triton_mamba.py` -- Hardware-accelerated with chunked streaming.
-
-- Fused Triton kernel for parallel associative scan (requires `triton`)
-- Automatic fallback to chunked PyTorch scan if Triton unavailable
-- Memory-efficient streaming across chunks (configurable `chunk_size`, default 2048)
-
-### 3. Official Mamba SSM
-
-`models/official_mamba.py` -- Wrapper around the [mamba-ssm](https://github.com/state-spaces/mamba) package.
-
-- Requires `pip install causal-conv1d>=1.2.0 mamba-ssm`
-- Uses the exact CUDA kernels from the Gu & Dao paper
-
-### 4. GRU + Attention Baseline
-
-`models/gru_baseline.py` -- Classical RNN+Attention for benchmarking.
-
-- Multi-layer GRU -> Masked Multi-Head Attention
-- Uses PyTorch 2.0 `F.scaled_dot_product_attention` (FlashAttention/memory-efficient backends)
-- Causal masking with O(N) memory
-- Optional KV caching for streaming inference
-
----
-
-## Requirements
+## 🛠️ Installation
 
 ```bash
-pip install torch pandas numpy scikit-learn tqdm matplotlib seaborn scipy
-```
-
-For hardware-accelerated Mamba:
-
-```bash
-# Triton Mamba (Linux/WSL only)
-pip install triton
-
-# Official Mamba-SSM (requires CUDA compilation tools)
-pip install causal-conv1d>=1.2.0 mamba-ssm
+conda create -n gait_env python=3.11
+conda activate gait_env
+pip install torch pandas numpy scikit-learn tqdm matplotlib seaborn
+# Optional: pip install mamba-ssm triton (for hardware acceleration)
 ```
 
 ---
 
-## Training
+## 🏋️ Training
 
-AMP (bfloat16 on H100, float16 elsewhere) and gradient accumulation are enabled by default. Uses **Focal Loss** with inverse-frequency class weights for PIVD separation.
+The training script automatically handles data splitting, normalization, and checkpointing.
 
+### Recommended (BiMamba + LOPO)
 ```bash
-# Native PyTorch Mamba -- legacy features (5)
-python train.py --data_dir "Datasets/" --epochs 50 --batch_size 2
-
-# Native PyTorch Mamba -- enhanced features (22)
-python train.py --data_dir "Datasets/" --epochs 50 --batch_size 2 --enhanced_features
-
-# GRU + Attention Baseline
-python train.py --data_dir "Datasets/" --epochs 50 --batch_size 2 --use_gru_baseline
-
-# Triton-Accelerated Mamba
-python train.py --data_dir "Datasets/" --epochs 50 --batch_size 2 --use_triton_mamba
-
-# Official Mamba-SSM
-python train.py --data_dir "Datasets/" --epochs 50 --batch_size 2 --use_official_mamba
+python train.py --data_dir Datasets/ --model_type bimamba --epochs 80
 ```
 
-Key flags:
+### Prototypical Training (For high imbalance)
+```bash
+python train.py --data_dir Datasets/ --model_type bimamba --use_prototype_head
+```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--epochs` | 50 | Training epochs |
-| `--batch_size` | 2 | Batch size (keep small for long sequences) |
-| `--accum_steps` | 8 | Gradient accumulation steps |
-| `--lr` | 1e-3 | Peak learning rate (OneCycleLR) |
-| `--d_model` | 64 | Hidden dimension (capped at 32 for small datasets) |
-| `--n_layers` | 2 | Number of SSM/GRU layers |
-| `--focal_gamma` | 2.0 | Focal Loss gamma (0 = standard CE, 2 = hard-example focus) |
-| `--enhanced_features` | off | Use 22-feature mode instead of legacy 5 |
-| `--output_name` | `best_model.pth` | Saved weights filename |
-
-The best model (by validation F1) is saved automatically.
+### Fast Iteration (K-Fold)
+```bash
+python train.py --data_dir Datasets/ --model_type gru --cv_mode kfold --n_folds 5
+```
 
 ---
 
-## Evaluation
+## 📊 Evaluation
 
-`evaluate.py` generates a full classification report, confusion matrix plot, and inference benchmarking metrics.
+The evaluation script auto-detects the architecture from the checkpoint file.
 
 ```bash
-# Evaluate Native Mamba
-python evaluate.py --model_path best_model.pth --data_dir "Datasets/"
+# Basic evaluation
+python evaluate.py --model_path checkpoints/best_model.pth --data_dir Datasets/
 
-# Evaluate GRU Baseline
-python evaluate.py --model_path best_gru_baseline.pth --data_dir "Datasets/" --use_gru_baseline
-
-# Detailed per-batch timing breakdown
-python evaluate.py --model_path best_model.pth --data_dir "Datasets/" --benchmark
+# Benchmarking inference speed
+python evaluate.py --model_path checkpoints/best_model.pth --data_dir Datasets/ --benchmark
 ```
-
-**Metrics reported:**
-
-| Category | Metrics |
-|----------|---------|
-| Classification | Accuracy, F1 (weighted), ROC-AUC (OVR), per-class precision/recall |
-| Inference | Total/trainable parameters, model size (MB), latency/sample (ms), throughput (samples/s), peak GPU memory |
-
-> **Important**: Architecture flags (`--d_model`, `--n_layers`, `--use_*`) must match the trained model exactly.
 
 ---
 
-## Exploratory Data Analysis (EDA)
+## ☁️ HPC Deployment
 
-A standalone analysis module that operates on the same raw CSV files without touching the training pipeline.
-
-### Features Extracted
-
-**Base features** (same as training): `e_ant`, `e_ago`, `torque`, `stiffness`
-
-**Time-domain** (per channel, per window):
-RMS, MAV, Variance, Waveform Length, Zero Crossing Rate, Slope Sign Changes, IEMG
-
-**Frequency-domain** (per channel, per window via Welch PSD):
-Mean Frequency, Median Frequency, Spectral Entropy, Peak Frequency, Total Spectral Power
-
-### Running
-
-```bash
-python EDA/eda_runner.py --data_dir "path/to/Datasets"
-```
-
-Optional: `--window_size 2000`, `--stride 1000`, `--alpha 1.0`, `--beta 1.0`, `--fs 1000`
-
-### Generated Outputs
-
-All saved to `EDA/outputs/`:
-
-| Output | Description |
-|--------|-------------|
-| `eda_feature_table.csv` | Unified feature dataframe (all windows, all patients) |
-| `scatter_torque_vs_stiffness.png` | Scatter with convex hulls per class |
-| `scatter_rms_ant_vs_rms_ago.png` | RMS channel comparison with hulls |
-| `feature_correlation_heatmap.png` | Hierarchical clustermap of feature correlations |
-| `pca_projection.png` | PC1 vs PC2 coloured by pathology |
-| `lda_projection.png` | LD1 vs LD2 coloured by pathology |
-| `feature_distributions.png` | Per-class histograms + boxplots for key features |
-| `waveform_<class>.png` | Agonist-antagonist interaction, torque, stiffness |
-| `waveform_comparison.png` | Side-by-side waveform comparison across all classes |
-| `gait_phase_<class>.png` | EMG overlay with anchored gait phase per class |
-| `gait_phase_comparison.png` | Side-by-side gait phase comparison across all classes |
-
----
-
-## HPC Deployment
-
-### PBS Job Submission
+To run on a cluster (H100 GPU), configure your paths in `submit_gait.sh` and run:
 
 ```bash
 qsub submit_gait.sh
 ```
 
-The PBS script (`submit_gait.sh`) requests 1x H100 GPU, 10 CPUs, 32 GB RAM and runs both Mamba and GRU training sequentially with enhanced features.
-
-### Quick SSH Connect (Windows)
-
-```cmd
-connect_hpc.bat [username] [host]
-connect_hpc.bat                      :: defaults to aantriksh.124259@10.16.1.50
-```
-
-Automatically loads CUDA, activates `gait_env`, and navigates to the project directory.
-
 ---
 
-## Changelog
-
-### v3.0 -- EMG-Anchored Gait Phase & Focal Loss *(2026-04-30)*
-
-**Added**
-- `gait_phase.py`: Two-stage EMG-anchored gait phase algorithm
-  - Stage 1: Phase velocity proportional to instantaneous EMG activity (TA + GA RMS)
-  - Stage 2: PCHIP re-normalization to anchor physiological landmarks (heel strike -> 0%, loading end -> 12%, GA peak -> 55%, toe-off -> 62%)
-  - Cycle boundary detection via TKEO + multi-method fusion (threshold, derivative, autocorrelation)
-- `feature_config.py`: Feature selection configuration (legacy 5 / enhanced 22 features)
-- Focal Loss (`train.py`): gamma=2.0 with inverse-frequency class weights for PIVD separation
-- Per-class classification report printed at end of training
-- Gait phase overlay visualizations in EDA (`gait_phase_*.png`)
-
-**Changed**
-- Label smoothing reduced from 0.1 -> 0.02 (less aggressive for minority classes)
-- `evaluate()` now returns labels/preds for downstream reporting
-- EDA visualization: NaN-safe correlation heatmap, co-activation zone overlays
-
-### v2.1 -- EDA Module & Inference Benchmarking *(2026-03-14)*
-
-**Added**
-- `EDA/` module -- full exploratory data analysis pipeline
-  - 7 time-domain + 5 frequency-domain EMG features per channel
-  - Scatter plots with convex hulls, hierarchical correlation clustermap
-  - PCA and LDA projections, per-class feature distributions
-  - Signal waveform plots: agonist-antagonist interaction with clinical interpretations, multi-class comparison grid, smart auto-clipping
-- Inference benchmarking in `evaluate.py` -- latency, throughput, parameter count, GPU memory (`--benchmark` flag)
-
-### v2.0 -- Numerical Stability & Mamba Fixes *(2026-03-13)*
-
-**Fixed**
-- **NaN loss elimination**: forced float32 for Mamba recurrence (prevents bfloat16 drift over 2000 timesteps)
-- **GradScaler disabled for bfloat16**: H100 bfloat16 + GradScaler silently corrupted SSM state
-- Periodic state clamping (every 100 steps) to prevent runaway accumulation
-- Clamped transition matrix A and dt projections for numerical stability
-
-**Changed**
-- `triton_mamba.py`: uses clamped dt and A matrices throughout chunked scan
-- `native_mamba.py`: identical stability fixes
-- All Mamba blocks cast to float32 internally, return to original dtype
-
-### v1.0 -- Initial Pipeline
-
-**Core**
-- Physics-informed feature engineering (Torque, Stiffness)
-- Patient-level strict splitting with dynamic stride balancing
-- Sliding window segmentation (2000-sample windows)
-- Global normalization with hard outlier clamping
-- Temporal jittering + random scaling augmentation
-
-**Models**
-- Native PyTorch Mamba SSM
-- Triton/CUDA fused Mamba with chunked streaming
-- Official mamba-ssm wrapper
-- GRU + FlashAttention baseline
-
-**Training**
-- AMP (bfloat16/float16 auto-detect), gradient accumulation
-- OneCycleLR scheduler, label smoothing (0.1)
-- NaN batch skipping, gradient clipping
-
-**Evaluation**
-- Full classification report, confusion matrix visualization
-- Multi-class ROC-AUC (OVR) with safe handling of missing classes
+## 📝 License
+Research Use Only.
