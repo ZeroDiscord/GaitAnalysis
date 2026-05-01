@@ -14,6 +14,10 @@ module load cuda
 # Makes CUDA errors synchronous — gives accurate stack traces if it crashes
 export CUDA_LAUNCH_BLOCKING=1
 
+# Auto-select the GPU with the most free memory
+export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=memory.free,index --format=csv,nounits,noheader | sort -nr | head -1 | awk '{print $2}')
+echo "Selected GPU: $CUDA_VISIBLE_DEVICES"
+
 echo "--- GPU STATUS BEFORE TRAINING ---"
 nvidia-smi
 echo "----------------------------------"
