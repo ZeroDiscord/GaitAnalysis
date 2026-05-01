@@ -178,10 +178,9 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device,
         if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
-        
-        if scheduler is not None:
-            scheduler.step()
         
         current_loss = loss.item()
         running_loss += (current_loss * accum_steps) * features.size(0)
@@ -268,6 +267,8 @@ def main():
     parser.add_argument('--output_dir', type=str, default='checkpoints/')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader workers (set to ncpus-2 on HPC, e.g. 8)')
     args = parser.parse_args()
     
     set_seed(args.seed)
@@ -326,12 +327,19 @@ def main():
             global_mean=g_mean, global_std=g_std, balance_classes=False,
         )
         
+        pin = (device.type == 'cuda')
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                                  collate_fn=collate_fn_pad)
+                                  collate_fn=collate_fn_pad,
+                                  num_workers=args.num_workers, pin_memory=pin,
+                                  persistent_workers=args.num_workers > 0)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                                collate_fn=collate_fn_pad)
+                                collate_fn=collate_fn_pad,
+                                num_workers=args.num_workers, pin_memory=pin,
+                                persistent_workers=args.num_workers > 0)
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                                 collate_fn=collate_fn_pad)
+                                 collate_fn=collate_fn_pad,
+                                 num_workers=args.num_workers, pin_memory=pin,
+                                 persistent_workers=args.num_workers > 0)
         
         # Class weights from PATIENT counts (not window counts)
         patient_counts = train_ds.get_patient_class_counts()
@@ -356,9 +364,9 @@ def main():
         # Optimizer + scheduler
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.02)
         steps_per_epoch = len(train_loader)
-        total_steps = max(args.epochs * steps_per_epoch, 2)
+        total_optim_steps = max(args.epochs * (steps_per_epoch // max(args.accum_steps, 1)), 2)
         scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=args.lr, total_steps=total_steps,
+            optimizer, max_lr=args.lr, total_steps=total_optim_steps,
             pct_start=0.1, anneal_strategy='cos',
         )
         
