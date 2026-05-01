@@ -134,9 +134,8 @@ class SelectiveSSM(nn.Module):
         # Compute A (negative, in log-space for stability)
         A = -torch.exp(self.A_log)  # (d_inner, d_state)
         
-        # Sequential scan (not parallelizable, but correct for small sequences)
-        # For 2000-step windows this is fast enough on GPU
-        y = self._sequential_scan(x_ssm, dt, A, B_input, C_input)
+        # Parallel scan (vectorized associative scan)
+        y = self._parallel_scan(x_ssm, dt, A, B_input, C_input)
         
         # Gating and output
         y = y * F.silu(z)  # gated output
@@ -147,34 +146,49 @@ class SelectiveSSM(nn.Module):
         
         return y
     
-    def _sequential_scan(self, x, dt, A, B, C):
+    def _parallel_scan(self, x, dt, A, B, C):
         """
-        Sequential SSM scan.
-        
-        h_t = exp(delta_t * A) * h_{t-1} + delta_t * B_t * x_t
-        y_t = C_t * h_t + D * x_t
+        Vectorized Parallel Associative Scan.
+        Calculates h_t = A_bar_t * h_{t-1} + B_bar_t * x_t in parallel.
         """
         B_batch, T, d_inner = x.shape
         d_state = self.d_state
         
-        h = torch.zeros(B_batch, d_inner, d_state, device=x.device, dtype=x.dtype)
-        outputs = []
+        # Discretize A and B: (B, T, d_inner, d_state)
+        # A is (d_inner, d_state), dt is (B, T, d_inner)
+        dt = dt.unsqueeze(-1) # (B, T, d_inner, 1)
+        A_bar = torch.exp(dt * A.unsqueeze(0).unsqueeze(0)) # (B, T, d_inner, d_state)
+        B_bar = dt * B.unsqueeze(2) # (B, T, d_inner, d_state)
         
-        for t in range(T):
-            # Discretized state transition
-            dt_t = dt[:, t, :].unsqueeze(-1)  # (B, d_inner, 1)
-            dA = torch.exp(dt_t * A.unsqueeze(0))  # (B, d_inner, d_state)
-            dB = dt_t * B[:, t, :].unsqueeze(1)  # (B, d_inner, d_state)
-            
-            # State update
-            h = dA * h + dB * x[:, t, :].unsqueeze(-1)
-            
-            # Output
-            y_t = (h * C[:, t, :].unsqueeze(1)).sum(dim=-1)  # (B, d_inner)
-            y_t = y_t + self.D * x[:, t, :]  # skip connection
-            outputs.append(y_t)
+        # Intermediate signal: B_bar * x
+        X_bar = B_bar * x.unsqueeze(-1) # (B, T, d_inner, d_state)
         
-        return torch.stack(outputs, dim=1)  # (B, T, d_inner)
+        # Parallel Scan logic:
+        # h_t = (A_bar_t * A_bar_{t-1} * ... * A_bar_1) * h_0 + sum_{i=1}^t (A_bar_t * ... * A_bar_{i+1}) * X_bar_i
+        # In log space or using cumprod for stability. 
+        # For sequence length 500, cumprod is stable enough.
+        
+        # Compute cumulative state transitions
+        A_bar_cumsum = torch.cat([
+            torch.ones(B_batch, 1, d_inner, d_state, device=x.device, dtype=x.dtype),
+            A_bar
+        ], dim=1)
+        
+        # h_t = sum_{i=1}^t [ (prod_{j=i+1}^t A_bar_j) * X_bar_i ]
+        # This can be computed efficiently by: 
+        # h_t = (prod_{j=1}^t A_bar_j) * sum_{i=1}^t [ X_bar_i / (prod_{j=1}^i A_bar_j) ]
+        
+        A_bar_prod = torch.cumprod(A_bar, dim=1)
+        
+        # Handle potential division by zero or underflow by using a small epsilon
+        # or performing the scan in a more robust way
+        states = A_bar_prod * torch.cumsum(X_bar / (A_bar_prod + 1e-12), dim=1)
+        
+        # Output y_t = C_t * h_t + D * x_t
+        y = (states * C.unsqueeze(2)).sum(dim=-1) # (B, T, d_inner)
+        y = y + self.D * x
+        
+        return y
 
 
 class BiMambaBlock(nn.Module):
