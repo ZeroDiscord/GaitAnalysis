@@ -18,8 +18,8 @@ python3 train.py \
     --model_type bimamba \
     --cv_mode lopo \
     --epochs 80 \
-    --batch_size 8 \
-    --accum_steps 4 \
+    --batch_size 4 \
+    --accum_steps 8 \
     --lr 5e-4 \
     --d_model 64 \
     --n_layers 2 \
@@ -35,8 +35,8 @@ python3 train.py \
     --model_type gru \
     --cv_mode lopo \
     --epochs 80 \
-    --batch_size 8 \
-    --accum_steps 4 \
+    --batch_size 4 \
+    --accum_steps 8 \
     --lr 5e-4 \
     --d_model 64 \
     --n_layers 2 \

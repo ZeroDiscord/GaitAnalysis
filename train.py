@@ -292,6 +292,9 @@ def main():
     train_aug = AugmentationPipeline.default_emg()
     
     for fold_idx in range(n_folds):
+        # Clear GPU memory from previous fold
+        torch.cuda.empty_cache()
+        
         split = splits[fold_idx]
         train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, \
             class_to_idx, classes, fold_name = split
@@ -331,25 +334,25 @@ def main():
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                   collate_fn=collate_fn_pad,
                                   num_workers=args.num_workers, pin_memory=pin,
-                                  persistent_workers=args.num_workers > 0)
+                                  persistent_workers=False)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                                 collate_fn=collate_fn_pad,
                                 num_workers=args.num_workers, pin_memory=pin,
-                                persistent_workers=args.num_workers > 0)
+                                persistent_workers=False)
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                                  collate_fn=collate_fn_pad,
                                  num_workers=args.num_workers, pin_memory=pin,
-                                 persistent_workers=args.num_workers > 0)
+                                 persistent_workers=False)
         
         # Class weights from PATIENT counts (not window counts)
         patient_counts = train_ds.get_patient_class_counts()
         class_weights = 1.0 / (patient_counts.astype(float) + 1e-6)
         class_weights = class_weights / class_weights.sum() * num_classes
-        class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
-        print(f"  Patient-level class weights: {dict(zip(classes, class_weights.cpu().numpy().round(2)))}")
+        class_weights = torch.tensor(class_weights, dtype=torch.float32)
+        print(f"  Patient-level class weights: {dict(zip(classes, class_weights.numpy().round(2)))}")
         
         # Loss
-        criterion = FocalLoss(weight=class_weights, gamma=args.focal_gamma, label_smoothing=0.02)
+        criterion = FocalLoss(weight=class_weights.to(device), gamma=args.focal_gamma, label_smoothing=0.02)
         
         # Model
         model = create_model(
