@@ -251,15 +251,15 @@ def main():
     parser.add_argument('--model_type', type=str, default='bimamba',
                         choices=['bimamba', 'gru', 'mamba', 'triton_mamba'])
     parser.add_argument('--epochs', type=int, default=60)
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--accum_steps', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--accum_steps', type=int, default=1)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--n_layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--focal_gamma', type=float, default=2.0)
-    parser.add_argument('--window_size', type=int, default=2000)
-    parser.add_argument('--stride', type=int, default=1000)
+    parser.add_argument('--window_size', type=int, default=500)
+    parser.add_argument('--stride', type=int, default=250)
     parser.add_argument('--use_prototype_head', action='store_true')
     parser.add_argument('--cv_mode', type=str, default='lopo', choices=['lopo', 'kfold'])
     parser.add_argument('--n_folds', type=int, default=5, help='Number of folds for kfold mode')
@@ -330,7 +330,7 @@ def main():
             global_mean=g_mean, global_std=g_std, balance_classes=False,
         )
         
-        pin = (device.type == 'cuda')
+        pin = False  # pin_memory causes async CUDA errors to surface at wrong line
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                   collate_fn=collate_fn_pad,
                                   num_workers=args.num_workers, pin_memory=pin,
