@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
                              roc_auc_score, classification_report, recall_score)
+from tqdm import tqdm
 
 from dataset import GaitDataset, collate_fn_pad, discover_dataset, create_dataloaders
 from checkpoint_utils import load_checkpoint
@@ -119,7 +120,7 @@ def run_evaluation(model, dataloader, device, num_classes, class_names, benchmar
     wall_start = time.perf_counter()
 
     with torch.no_grad():
-        for features, masks, labels in dataloader:
+        for features, masks, labels in tqdm(dataloader, desc="Evaluating"):
             features = features.to(device)
             masks = masks.to(device)
             labels = labels.to(device)

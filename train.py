@@ -34,6 +34,7 @@ import argparse
 import numpy as np
 import random
 from collections import defaultdict
+from tqdm import tqdm
 
 from dataset import (GaitDataset, collate_fn_pad, discover_dataset,
                      patient_level_lopo_splits, patient_level_kfold_splits)
@@ -152,7 +153,8 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device,
     nan_batches = 0
     
     optimizer.zero_grad()
-    for i, (features, masks, labels) in enumerate(loader):
+    pbar = tqdm(loader, desc=f"      Train", leave=False)
+    for i, (features, masks, labels) in enumerate(pbar):
         features = features.to(device)
         masks = masks.to(device)
         labels = labels.to(device)
@@ -181,10 +183,14 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device,
         if scheduler is not None:
             scheduler.step()
         
-        running_loss += (loss.item() * accum_steps) * features.size(0)
+        current_loss = loss.item()
+        running_loss += (current_loss * accum_steps) * features.size(0)
         _, preds = torch.max(outputs, 1)
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
+        
+        # Update progress bar
+        pbar.set_postfix({'loss': f'{current_loss:.4f}'})
     
     if nan_batches > 0:
         print(f"  WARNING: {nan_batches} NaN batches skipped")
@@ -199,7 +205,7 @@ def evaluate(model, loader, criterion, device, num_classes, use_prototype=False)
     running_loss = 0.0
     all_preds, all_labels, all_probs = [], [], []
     
-    for features, masks, labels in loader:
+    for features, masks, labels in tqdm(loader, desc="      Eval ", leave=False):
         features = features.to(device)
         masks = masks.to(device)
         labels = labels.to(device)
