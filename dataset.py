@@ -75,7 +75,8 @@ class GaitDataset(Dataset):
         self.num_classes = len(self.classes)
         self.input_dim = 5  # Will be set after first feature extraction
         
-        # Load raw signals per file (NOT features -- compute features per window)
+        # Pre-compute all features per file ONCE to avoid CPU bottleneck in Dataloader
+        # and to ensure gait_phase spline has access to full file context for accurate peaks.
         self.base_samples = []
         for path, label in zip(file_paths, labels):
             df = pd.read_csv(path, header=None)
@@ -83,12 +84,21 @@ class GaitDataset(Dataset):
             e_ant = df.iloc[:, 1].values.astype(np.float64)  # GA
             e_ago = np.nan_to_num(e_ago, nan=0.0, posinf=0.0, neginf=0.0)
             e_ant = np.nan_to_num(e_ant, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Pre-compute
+            torque = e_ant - e_ago
+            stiffness = e_ant + e_ago
+            try:
+                gait_phase = assign_gait_phase_continuous(e_ago, e_ant, self.fs)
+            except Exception:
+                gait_phase = np.linspace(0, 100, len(e_ago), dtype=np.float32)
+            
+            features = np.column_stack([e_ant, e_ago, torque, stiffness, gait_phase]).astype(np.float32)
+            
             self.base_samples.append({
-                'e_ago': e_ago,
-                'e_ant': e_ant,
+                'features': features,
                 'label': label,
-                'length': len(e_ago),
-                'path': path,
+                'length': len(features),
             })
         
         # Sliding window segmentation with class balancing
@@ -131,22 +141,12 @@ class GaitDataset(Dataset):
         
         print(f"Set '{mode}': {len(self.base_samples)} files -> {len(self.windows)} windows")
     
-    def _extract_window_features(self, e_ago: np.ndarray, e_ant: np.ndarray) -> np.ndarray:
+    def _extract_window_features(self, sample_idx: int, start: int, end: int) -> np.ndarray:
         """
-        Extract 5-feature vector per timestep from a window.
-        
+        Get 5-feature vector per timestep from a pre-computed window.
         Returns: (T, 5) array: [e_ant, e_ago, torque, stiffness, gait_phase]
         """
-        torque = e_ant - e_ago
-        stiffness = e_ant + e_ago
-        
-        try:
-            gait_phase = assign_gait_phase_continuous(e_ago, e_ant, self.fs)
-        except Exception:
-            gait_phase = np.linspace(0, 100, len(e_ago), dtype=np.float32)
-        
-        features = np.column_stack([e_ant, e_ago, torque, stiffness, gait_phase])
-        return features.astype(np.float32)
+        return self.base_samples[sample_idx]['features'][start:end].copy()
     
     def _compute_global_stats(self):
         """Compute global mean/std from training windows (sampled for efficiency)."""
@@ -160,9 +160,7 @@ class GaitDataset(Dataset):
             start = win['start']
             end = min(start + self.window_size, sample['length'])
             
-            e_ago = sample['e_ago'][start:end]
-            e_ant = sample['e_ant'][start:end]
-            features = self._extract_window_features(e_ago, e_ant)
+            features = self._extract_window_features(win['sample_idx'], start, end)
             all_features.append(features)
         
         all_data = np.concatenate(all_features, axis=0)
@@ -203,11 +201,8 @@ class GaitDataset(Dataset):
             new_start = start
             end = min(new_start + self.window_size, sample['length'])
         
-        e_ago = sample['e_ago'][new_start:end].copy()
-        e_ant = sample['e_ant'][new_start:end].copy()
-        
-        # Extract per-window features
-        features = self._extract_window_features(e_ago, e_ant)  # (T, 5)
+        # Extract per-window features from pre-computed array
+        features = self._extract_window_features(win['sample_idx'], new_start, end)  # (T, 5)
         
         # Apply augmentation BEFORE normalization (on raw amplitude scale)
         if self.mode == 'train' and self.augmentation is not None:
