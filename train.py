@@ -415,6 +415,9 @@ def main():
                 save_checkpoint(model, config, ckpt_path, extra={
                     'epoch': epoch, 'best_macro_f1': best_macro_f1,
                     'fold': fold_name,
+                    'global_mean': train_ds.global_mean.tolist(),
+                    'global_std': train_ds.global_std.tolist(),
+                    'classes': classes
                 })
             else:
                 patience_counter += 1
