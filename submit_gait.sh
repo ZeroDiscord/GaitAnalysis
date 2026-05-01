@@ -5,7 +5,7 @@
 #PBS -j oe
 #PBS -V 
 
-cd "/home/aantriksh.124259/GaitAnalysis-dev"
+cd "/home/aantriksh.124259/Gait Analysis"
 
 source /home/soft/anaconda3/etc/profile.d/conda.sh
 conda activate gait_env
