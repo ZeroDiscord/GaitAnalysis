@@ -263,7 +263,7 @@ def main():
     parser.add_argument('--window_size', type=int, default=500)
     parser.add_argument('--stride', type=int, default=250)
     parser.add_argument('--use_prototype_head', action='store_true')
-    parser.add_argument('--cv_mode', type=str, default='lopo', choices=['lopo', 'kfold'])
+    parser.add_argument('--cv_mode', type=str, default='lopo', choices=['lopo', 'kfold', 'none'])
     parser.add_argument('--n_folds', type=int, default=5, help='Number of folds for kfold mode')
     parser.add_argument('--single_fold', action='store_true', help='Run only first fold')
     parser.add_argument('--output_dir', type=str, default='checkpoints/')
@@ -284,6 +284,11 @@ def main():
     # Get splits
     if args.cv_mode == 'lopo':
         splits = list(patient_level_lopo_splits(args.data_dir))
+    elif args.cv_mode == 'none':
+        # Train on 100% of data. Use everything for train, and same for val.
+        all_paths, all_labels, class_to_idx, classes = discover_dataset(args.data_dir)
+        # We wrap it in a list so it behaves like a single "fold"
+        splits = [(all_paths, all_labels, all_paths, all_labels, all_paths, all_labels, class_to_idx, classes, 'final_model')]
     else:
         splits = list(patient_level_kfold_splits(args.data_dir, args.n_folds, args.seed))
     

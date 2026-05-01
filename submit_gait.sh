@@ -60,7 +60,26 @@ python3 train.py \
     --num_workers 4 \
     --output_dir "checkpoints/"
 
-# 3. Evaluate best BiMamba checkpoint
+# 3. Final Production Model — Train on 100% of data
+echo "--- Training FINAL Production Model on H100 ---"
+python3 train.py \
+    --data_dir "/home/aantriksh.124259/Datasets" \
+    --model_type bimamba \
+    --cv_mode none \
+    --epochs 60 \
+    --batch_size 16 \
+    --accum_steps 1 \
+    --lr 5e-4 \
+    --d_model 64 \
+    --n_layers 2 \
+    --dropout 0.1 \
+    --patience 20 \
+    --window_size 500 \
+    --stride 250 \
+    --num_workers 4 \
+    --output_dir "checkpoints_final/"
+
+# 4. Evaluate best BiMamba checkpoint
 echo "--- Evaluating BiMamba ---"
 CHECKPOINT=$(find checkpoints/ -name "best_*.pth" -print -quit 2>/dev/null)
 if [ -n "$CHECKPOINT" ]; then
