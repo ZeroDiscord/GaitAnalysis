@@ -46,8 +46,10 @@ python3 train.py \
 
 # 3. Evaluate best BiMamba checkpoint
 echo "--- Evaluating BiMamba ---"
+CHECKPOINT=$(ls checkpoints/best_*.pth | head -n 1)
+echo "Evaluating checkpoint: $CHECKPOINT"
 python3 evaluate.py \
-    --model_path "checkpoints/best_sample_0.csv.pth" \
+    --model_path "$CHECKPOINT" \
     --data_dir "/home/aantriksh.124259/Datasets" \
     --output_plot "confusion_bimamba.png" \
     --benchmark
