@@ -11,8 +11,9 @@ source /home/soft/anaconda3/etc/profile.d/conda.sh
 conda activate gait_env
 module load cuda
 
+# Use GPU 1 because GPU 0 is currently full on the node
+export CUDA_VISIBLE_DEVICES=1
 
-# 1. BiMamba — LOPO Cross-Validation (recommended)
 echo "--- Starting BiMamba LOPO Training on H100 ---"
 python3 train.py \
     --data_dir "/home/aantriksh.124259/Datasets" \
