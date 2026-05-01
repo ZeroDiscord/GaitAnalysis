@@ -14,6 +14,10 @@ module load cuda
 # Makes CUDA errors synchronous — gives accurate stack traces if it crashes
 export CUDA_LAUNCH_BLOCKING=1
 
+echo "--- GPU STATUS BEFORE TRAINING ---"
+nvidia-smi
+echo "----------------------------------"
+
 # 1. BiMamba — LOPO Cross-Validation
 echo "--- Starting BiMamba LOPO Training on H100 ---"
 python3 train.py \
