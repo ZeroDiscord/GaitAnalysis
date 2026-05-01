@@ -18,14 +18,14 @@ python3 train.py \
     --model_type bimamba \
     --cv_mode lopo \
     --epochs 80 \
-    --batch_size 4 \
-    --accum_steps 8 \
+    --batch_size 2 \
+    --accum_steps 16 \
     --lr 5e-4 \
     --d_model 64 \
     --n_layers 2 \
     --dropout 0.1 \
     --patience 20 \
-    --num_workers 4 \
+    --num_workers 0 \
     --output_dir "checkpoints/"
 
 # 2. GRU Baseline — LOPO Cross-Validation
@@ -35,14 +35,14 @@ python3 train.py \
     --model_type gru \
     --cv_mode lopo \
     --epochs 80 \
-    --batch_size 4 \
-    --accum_steps 8 \
+    --batch_size 2 \
+    --accum_steps 16 \
     --lr 5e-4 \
     --d_model 64 \
     --n_layers 2 \
     --dropout 0.1 \
     --patience 20 \
-    --num_workers 4 \
+    --num_workers 0 \
     --output_dir "checkpoints/"
 
 # 3. Evaluate best BiMamba checkpoint (if training succeeded)
