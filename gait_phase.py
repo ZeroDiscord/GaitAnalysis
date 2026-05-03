@@ -26,6 +26,7 @@ Column mapping (matches dataset.py convention):
 """
 
 import numpy as np
+from typing import Tuple, List, Dict, Optional
 from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
 from scipy.interpolate import PchipInterpolator
 
@@ -673,47 +674,37 @@ def _anchor_phase_to_landmarks(raw_phase: np.ndarray,
     return anchored
 
 
+def compute_cci(ta_rms: np.ndarray, ga_rms: np.ndarray) -> np.ndarray:
+    """
+    Compute sample-wise Co-Contraction Index (CCI).
+    CCI = (2 * min(TA, GA)) / (TA + GA + eps)
+    
+    Range [0, 1]. 1.0 means perfect co-contraction (TA=GA), 
+    0.0 means pure reciprocal activation.
+    """
+    eps = 1e-8
+    return (2.0 * np.minimum(ta_rms, ga_rms)) / (ta_rms + ga_rms + eps)
+
+
 def assign_gait_phase_continuous(ta_signal: np.ndarray,
                                   ga_signal: np.ndarray,
-                                  fs: float = _FS_DEFAULT) -> np.ndarray:
+                                  fs: float = _FS_DEFAULT) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute a continuous gait phase ∈ [0, 100] for every timestep.
+    Compute continuous gait phase [0, 100], phase velocity, and CCI.
 
-    Algorithm (two-stage, EMG-anchored):
-
-      Stage 1 — EMG-driven phase velocity:
-        For each detected gait cycle, the raw RMS envelopes of the Tibialis
-        Anterior (TA) and Gastrocnemius (GA) are summed to form an
-        instantaneous total EMG activity signal.  Phase velocity at each
-        sample is v(t) = 0.15 + 0.85 · activity_norm(t), where
-        activity_norm is the cycle-peak-normalized total activity.  The
-        cumulative integral ∫v(t)dt, normalized to [0, 100], produces a
-        raw nonlinear phase that advances rapidly during gait events
-        (push-off, swing onset) and slowly during quiet periods (midstance).
-
-      Stage 2 — Physiological landmark anchoring:
-        Within each cycle, four explicit gait events are detected from
-        the raw RMS envelopes and forced to their canonical phase positions
-        via a monotonic PCHIP (C1-continuous) re-normalization:
-
-          Heel strike (cycle start)   → 0%   [TA burst onset]
-          Loading response end        → 12%  [TA deactivation]
-          GA peak (push-off)          → 55%  [max gastrocnemius RMS]
-          GA→TA crossover (toe-off)   → 62%  [GA/(GA+TA) < 0.5]
-
-        This ensures that the GA peak consistently maps to terminal stance
-        (~55%) and the stance-to-swing transition is explicitly defined at
-        the GA–TA dominance crossover (~62%), regardless of walking speed
-        or pathology.
-
-    Output shape: (T,) float32
+    Returns:
+        phase: (T,) array [0, 100]
+        velocity: (T,) array (phase units per sample)
+        cci: (T,) array [0, 1]
     """
     n = len(ta_signal)
 
-    # --- Raw RMS envelopes (same as visualization, NOT z-scored) ---
+    # --- Raw RMS envelopes ---
     rms_win = max(2, int(_RMS_WINDOW_MS * fs / 1000))
     ta_rms = _rolling_rms(np.abs(ta_signal.astype(np.float64)), rms_win)
     ga_rms = _rolling_rms(np.abs(ga_signal.astype(np.float64)), rms_win)
+    
+    cci = compute_cci(ta_rms, ga_rms)
 
     # Total EMG activity at each timestep
     activity = ta_rms + ga_rms
@@ -731,8 +722,8 @@ def assign_gait_phase_continuous(ta_signal: np.ndarray,
     if len(cycle_starts) < 2 or method == "Linear_Fallback":
         # Degenerate case: EMG-proportional phase across entire signal
         act_norm = activity / (activity.max() + 1e-12)
-        velocity = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
-        raw_phase = np.cumsum(velocity)
+        velocity_mod = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
+        raw_phase = np.cumsum(velocity_mod)
         phase = raw_phase / (raw_phase[-1] + 1e-12) * 100.0
     else:
         boundaries = np.append(cycle_starts, n)
@@ -751,8 +742,8 @@ def assign_gait_phase_continuous(ta_signal: np.ndarray,
                 continue
 
             act_norm = act_cycle / act_peak
-            velocity = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
-            raw_phase = np.cumsum(velocity)
+            velocity_mod = _PHASE_BASELINE_WEIGHT + _PHASE_EMG_WEIGHT * act_norm
+            raw_phase = np.cumsum(velocity_mod)
             raw_phase = raw_phase / raw_phase[-1] * 100.0
 
             # --- Stage 2: Anchor to physiological landmarks ---
@@ -762,7 +753,7 @@ def assign_gait_phase_continuous(ta_signal: np.ndarray,
                 raw_phase, ta_cycle, ga_cycle, cycle_len
             )
 
-        # Pre-first-cycle: EMG-driven loading phase [0, 12%]
+        # Pre-first-cycle
         if cycle_starts[0] > 0:
             pre_len = int(cycle_starts[0])
             act_pre = activity[:pre_len]
@@ -775,7 +766,11 @@ def assign_gait_phase_continuous(ta_signal: np.ndarray,
             else:
                 phase[:pre_len] = np.linspace(0.0, 12.0, pre_len)
 
-    return phase.astype(np.float32)
+    # Compute Phase Velocity (unwrapped)
+    velocity = np.diff(phase, prepend=phase[0])
+    velocity[velocity < -50] += 100.0  # Handle cycle reset wrap-around
+
+    return phase.astype(np.float32), velocity.astype(np.float32), cci.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -797,13 +792,17 @@ def extract_gait_cycle_features(ta_signal: np.ndarray,
         coactivation_ratio, GA_to_TA_ratio
         stance_duration, swing_duration, propulsion_phase_duration
         initial_contact_estimate, midstance_estimate,
-        terminal_stance_estimate, swing_phase_duration
+        terminal_stance_estimate, swing_phase_duration,
+        avg_phase_velocity, avg_cci, peak_cci
 
     If cycle detection fails, returns a neutral/zero feature dict.
     """
     n = len(ta_signal)
     ta_env = emg_envelope(ta_signal.astype(np.float64), fs)
     ga_env = emg_envelope(ga_signal.astype(np.float64), fs)
+
+    # Get sample-wise phase, velocity and CCI
+    phase, velocity, cci = assign_gait_phase_continuous(ta_signal, ga_signal, fs)
 
     cycle_starts, method = detect_gait_cycles(ta_env, ga_env, fs)
 
@@ -819,6 +818,7 @@ def extract_gait_cycle_features(ta_signal: np.ndarray,
         'propulsion_phase_duration': float('nan'),
         'initial_contact_estimate': float('nan'), 'midstance_estimate': float('nan'),
         'terminal_stance_estimate': float('nan'), 'swing_phase_duration': float('nan'),
+        'avg_phase_velocity': float('nan'), 'avg_cci': float('nan'), 'peak_cci': float('nan'),
         'cycle_count': 0,
         'method': method,
     }
@@ -928,6 +928,9 @@ def extract_gait_cycle_features(ta_signal: np.ndarray,
             'midstance_estimate': midstance,
             'terminal_stance_estimate': term_stance,
             'swing_phase_duration': swing_dur,
+            'avg_phase_velocity': float(np.mean(velocity[cs:ce])),
+            'avg_cci': float(np.mean(cci[cs:ce])),
+            'peak_cci': float(np.max(cci[cs:ce])),
         })
 
     if not all_cycles:
@@ -991,9 +994,10 @@ if __name__ == "__main__":
     ta_sim = ta_env * np.sin(2 * np.pi * carrier_freq * t / fs) + 0.05 * np.random.randn(len(t))
     ga_sim = ga_env * np.sin(2 * np.pi * carrier_freq * t / fs) + 0.05 * np.random.randn(len(t))
 
-    phase_out = assign_gait_phase_continuous(ta_sim, ga_sim, fs)
+    phase_out, vel_out, cci_out = assign_gait_phase_continuous(ta_sim, ga_sim, fs)
     print(f"Phase output shape : {phase_out.shape}")
     print(f"Phase range        : [{phase_out.min():.1f}, {phase_out.max():.1f}]")
+    print(f"CCI range          : [{cci_out.min():.2f}, {cci_out.max():.2f}]")
 
     _, method = detect_gait_cycles(emg_envelope(ta_sim, fs), emg_envelope(ga_sim, fs), fs)
     print(f"Method selected    : {method}")

@@ -72,7 +72,7 @@ def plot_scatter(df, x_col, y_col, classes, output_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, fname), dpi=150)
     plt.close(fig)
-    print(f'  ✓ Saved {fname}')
+    print(f'  [OK] Saved {fname}')
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ def plot_correlation_heatmap(df, output_dir):
     g.fig.suptitle('Feature Correlation Clustermap', fontsize=14, y=1.02)
     g.savefig(os.path.join(output_dir, 'feature_correlation_heatmap.png'), dpi=150, bbox_inches='tight')
     plt.close(g.fig)
-    print('  ✓ Saved feature_correlation_heatmap.png')
+    print('  [OK] Saved feature_correlation_heatmap.png')
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def plot_pca(df, classes, output_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, 'pca_projection.png'), dpi=150)
     plt.close(fig)
-    print('  ✓ Saved pca_projection.png (patient-level)')
+    print('  [OK] Saved pca_projection.png (patient-level)')
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +177,7 @@ def plot_lda(df, classes, output_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, 'lda_projection.png'), dpi=150)
     plt.close(fig)
-    print('  ✓ Saved lda_projection.png')
+    print('  [OK] Saved lda_projection.png')
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ def plot_ica(df, classes, output_dir, n_components=2):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, 'ica_projection.png'), dpi=150)
     plt.close(fig)
-    print('  ✓ Saved ica_projection.png')
+    print('  [OK] Saved ica_projection.png')
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +269,7 @@ def plot_feature_distributions(df, classes, output_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, 'feature_distributions.png'), dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print('  ✓ Saved feature_distributions.png')
+    print('  [OK] Saved feature_distributions.png')
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +377,8 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
 
         fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
                                  gridspec_kw={'height_ratios': [2, 1, 1]})
-        fig.suptitle(f'{cls_name}  \u2014  RMS envelope (window={rms_window})  \u2014  '
-                     f'samples {start}\u2013{end}  (patient: {patient_id})',
+        fig.suptitle(f'{cls_name}  -  RMS envelope (window={rms_window})  -  '
+                     f'samples {start}-{end}  (patient: {patient_id})',
                      fontsize=12, fontweight='bold')
 
         # Panel 1: Agonist + Antagonist RMS envelopes overlaid
@@ -394,7 +394,7 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
         ax.fill_between(t, rms_ago, rms_ant, alpha=0.10, color='grey')
         ax.set_ylabel('EMG amplitude (RMS)', fontsize=10)
         ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
-        ax.set_title('Agonist \u2013 Antagonist Interaction (RMS envelope)', fontsize=11, pad=4)
+        ax.set_title('Agonist - Antagonist Interaction (RMS envelope)', fontsize=11, pad=4)
         ax.grid(True, alpha=0.2)
         # Interpretation box
         ax.text(0.01, 0.97,
@@ -438,7 +438,7 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
         fname = f'waveform_{safe}.png'
         fig.savefig(os.path.join(output_dir, fname), dpi=150)
         plt.close(fig)
-        print(f'  \u2713 Saved {fname}')
+        print(f'  [OK] Saved {fname}')
 
     # ── Multi-class comparison grid ─────────────────────────────────────
     n_cls = len(all_classes)
@@ -504,7 +504,7 @@ def plot_signal_waveforms(data_dir, classes_with_paths, alpha, beta, output_dir,
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(os.path.join(output_dir, 'waveform_comparison.png'), dpi=150)
     plt.close(fig)
-    print('  \u2713 Saved waveform_comparison.png')
+    print('  [OK] Saved waveform_comparison.png')
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +579,7 @@ def plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir, fs=1000.0,
         ga_env = _rolling_rms(np.abs(e_ga), 50)
 
         # Compute gait phase
-        gait_phase = assign_gait_phase_continuous(e_ta, e_ga, fs)
+        gait_phase, _, _ = assign_gait_phase_continuous(e_ta, e_ga, fs)
 
         # Detect cycle boundaries for vertical dashed lines (approx from phase resets)
         phase_diff = np.diff(gait_phase)
@@ -645,7 +645,7 @@ def plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir, fs=1000.0,
         fname = f'gait_phase_{safe}.png'
         fig.savefig(os.path.join(output_dir, fname), dpi=150)
         plt.close(fig)
-        print(f'  ✓ Saved {fname}')
+        print(f'  [OK] Saved {fname}')
 
     # ── Multi-class comparison grid ────────────────────────────────────────
     n_cls = len(all_classes)
@@ -673,7 +673,7 @@ def plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir, fs=1000.0,
 
         ta_env = _rolling_rms(np.abs(e_ta), 50)
         ga_env = _rolling_rms(np.abs(e_ga), 50)
-        gait_phase = assign_gait_phase_continuous(e_ta, e_ga, fs)
+        gait_phase, _, _ = assign_gait_phase_continuous(e_ta, e_ga, fs)
         cycle_boundaries = np.where(np.diff(gait_phase) < -50)[0]
 
         # Row 0 — EMG envelopes
@@ -707,7 +707,7 @@ def plot_gait_phase_overlay(data_dir, classes_with_paths, output_dir, fs=1000.0,
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(os.path.join(output_dir, 'gait_phase_comparison.png'), dpi=150)
     plt.close(fig)
-    print('  ✓ Saved gait_phase_comparison.png')
+    print('  [OK] Saved gait_phase_comparison.png')
 
 
 def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1.0):
@@ -743,4 +743,3 @@ def generate_all_plots(df, classes, output_dir, data_dir=None, alpha=1.0, beta=1
         print('  (Skipping waveform/gait-phase plots — no data_dir provided)')
 
     print('All plots saved to', output_dir)
-

@@ -72,19 +72,19 @@ def main():
         stride=args.stride,
         fs=args.fs,
     )
-    print(f'   → {len(df)} windows from {df["patient_id"].nunique()} patients')
-    print(f'   → {len(df.columns)} columns, Classes: {classes}')
+    print(f'   -> {len(df)} windows from {df["patient_id"].nunique()} patients')
+    print(f'   -> {len(df.columns)} columns, Classes: {classes}')
 
-    # ── Step 4: Save feature table ────────────────────────────────────────
+    # -- Step 4: Save feature table ----------------------------------------
     csv_path = os.path.join(args.output_dir, 'eda_feature_table.csv')
     df.to_csv(csv_path, index=False)
-    print(f'\nFeature table saved → {csv_path}')
+    print(f'\nFeature table saved -> {csv_path}')
 
-    # ── Step 5–6: Visualisations ──────────────────────────────────────────
+    # -- Step 5-6: Visualisations ------------------------------------------
     generate_all_plots(df, classes, args.output_dir,
                        data_dir=args.data_dir, alpha=args.alpha, beta=args.beta)
 
-    # ── Done ──────────────────────────────────────────────────────────────
+    # -- Done --------------------------------------------------------------
     print('\n' + '=' * 60)
     print('  EDA complete — all artefacts in', args.output_dir)
     print('=' * 60)

@@ -20,6 +20,9 @@ Datasets/
 dataset/
 data/
 
+# Checkpoints 
+checkpoints*/
+
 # Environments
 .env
 .venv

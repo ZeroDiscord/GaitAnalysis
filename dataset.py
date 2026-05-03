@@ -73,7 +73,7 @@ class GaitDataset(Dataset):
         self.global_std = global_std
         self.classes = sorted(list(class_to_idx.keys()))
         self.num_classes = len(self.classes)
-        self.input_dim = 5  # Will be set after first feature extraction
+        self.input_dim = 5  # [e_ant, e_ago, torque, stiffness, gait_phase]
         
         # Pre-compute all features per file ONCE to avoid CPU bottleneck in Dataloader
         # and to ensure gait_phase spline has access to full file context for accurate peaks.
@@ -89,7 +89,7 @@ class GaitDataset(Dataset):
             torque = e_ant - e_ago
             stiffness = e_ant + e_ago
             try:
-                gait_phase = assign_gait_phase_continuous(e_ago, e_ant, self.fs)
+                gait_phase, _, _ = assign_gait_phase_continuous(e_ago, e_ant, self.fs)
             except Exception:
                 gait_phase = np.linspace(0, 100, len(e_ago), dtype=np.float32)
             
